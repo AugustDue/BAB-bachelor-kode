@@ -1,0 +1,540 @@
+# =============================================================================
+# PROPOSITION 3 — STRESSTEST (5 robusthedsanalyser)
+#
+# Forudsætter at Prop1 (original) er kørt, så følgende er tilgængelige:
+#   daglig, aktie_måned, mkt_exc_måned, rf_måned, marked_daglig,
+#   rf_daglig, w_fast, sigma2_xs, sigma2_ts, assign_deciles,
+#   euribor_ois (fra Prop3), ex_ante_beta_ewma (fra EWMA-kode)
+#
+# De 5 tabeller:
+#   (1) Ekskludering af de 10% mindste virksomheder (market equity)
+#   (2) Simple afkast i stedet for logaritmiske
+#   (3) EWMA beta (lambda = 0.97)
+#   (4) Værdivægtet BAB
+#   (5) Varierende shrinkage (Vasicek)
+# =============================================================================
+
+# ── HJÆLPEFUNKTION 1: Prop3-regressioner og tabel ────────────────────────────
+
+run_prop3_tabel <- function(bab_ret, titel) {
+  
+  p3 <- bab_ret %>%
+    filter(year_month >= "1994-01" & year_month <= "2021-12") %>%
+    mutate(beta_spread = (beta_H - beta_L) / (beta_H * beta_L)) %>%
+    left_join(euribor_ois %>% select(year_month, euribor_ois), by = "year_month") %>%
+    arrange(year_month) %>%
+    mutate(
+      lag_ted         = lag(euribor_ois),
+      change_ted      = euribor_ois - lag(euribor_ois),
+      lag_bab         = lag(bab_exc_m),
+      lag_beta_spread = lag(beta_spread),
+      z_lag_ted         = as.numeric(scale(lag_ted)),
+      z_change_ted      = as.numeric(scale(change_ted)),
+      z_lag_beta_spread = as.numeric(scale(lag_beta_spread)),
+      z_lag_bab         = as.numeric(scale(lag_bab)),
+      z_mkt             = as.numeric(scale(mkt_exc_m))
+    ) %>%
+    filter(!is.na(lag_ted) & !is.na(change_ted))
+  
+  model_1 <- lm(bab_exc_m ~ z_lag_ted + z_change_ted, data = p3)
+  model_2 <- lm(bab_exc_m ~ z_lag_ted + z_change_ted +
+                  z_lag_beta_spread + z_lag_bab + z_mkt, data = p3)
+  
+  get_stat <- function(mod, var) {
+    coefs <- summary(mod)$coefficients
+    if (var %in% rownames(coefs))
+      list(est = coefs[var, 1], tst = coefs[var, 3])
+    else
+      list(est = NA_real_, tst = NA_real_)
+  }
+  
+  vars <- list(
+    list(label = "Lagged EURIBOR-OIS spread",    z = "z_lag_ted"),
+    list(label = "Change in EURIBOR-OIS spread", z = "z_change_ted"),
+    list(label = "Beta spread",                  z = "z_lag_beta_spread"),
+    list(label = "Lagged BAB return",             z = "z_lag_bab"),
+    list(label = "Market return",                 z = "z_mkt")
+  )
+  
+  rows <- list()
+  for (v in vars) {
+    s1 <- get_stat(model_1, v$z)
+    s2 <- get_stat(model_2, v$z)
+    rows[[length(rows) + 1]] <- data.frame(
+      Variable = v$label, type = "est",
+      Col1 = s1$est, Col2 = s2$est, stringsAsFactors = FALSE
+    )
+    rows[[length(rows) + 1]] <- data.frame(
+      Variable = "", type = "tst",
+      Col1 = s1$tst, Col2 = s2$tst, stringsAsFactors = FALSE
+    )
+  }
+  tdf <- bind_rows(rows)
+  tdf <- bind_rows(
+    tdf,
+    data.frame(Variable = "Number of observations", type = "info",
+               Col1 = nrow(p3), Col2 = nrow(p3)),
+    data.frame(Variable = "Adjusted R²", type = "info",
+               Col1 = summary(model_1)$adj.r.squared,
+               Col2 = summary(model_2)$adj.r.squared)
+  )
+  
+  tdisp <- tdf %>%
+    mutate(
+      Col1_fmt = case_when(
+        type == "tst"  & !is.na(Col1) ~ sprintf("(%.2f)", Col1),
+        type == "info" & Variable == "Number of observations" ~ sprintf("%.0f", Col1),
+        type == "info" ~ sprintf("%.3f", Col1),
+        !is.na(Col1)   ~ sprintf("%.3f", Col1),
+        TRUE ~ ""
+      ),
+      Col2_fmt = case_when(
+        type == "tst"  & !is.na(Col2) ~ sprintf("(%.2f)", Col2),
+        type == "info" & Variable == "Number of observations" ~ sprintf("%.0f", Col2),
+        type == "info" ~ sprintf("%.3f", Col2),
+        !is.na(Col2)   ~ sprintf("%.3f", Col2),
+        TRUE ~ ""
+      )
+    ) %>%
+    select(Variable, Col1 = Col1_fmt, Col2 = Col2_fmt)
+  
+  sig1 <- which(tdf$type == "est" & !is.na(tdf$Col1) & abs(lead(tdf$Col1)) > 1.96)
+  sig2 <- which(tdf$type == "est" & !is.na(tdf$Col2) & abs(lead(tdf$Col2)) > 1.96)
+  
+  tgt <- tdisp %>%
+    gt() %>%
+    tab_header(title = titel) %>%
+    cols_label(Variable = "", Col1 = "(1)", Col2 = "(2)") %>%
+    cols_align(align = "right", columns = c(Col1, Col2)) %>%
+    cols_align(align = "left",  columns = Variable) %>%
+    tab_style(
+      style     = cell_borders(sides = "all", style = "hidden"),
+      locations = cells_body()
+    )
+  
+  if (length(sig1) > 0)
+    tgt <- tgt %>% tab_style(cell_text(weight = "bold"),
+                             cells_body(rows = sig1, columns = "Col1"))
+  if (length(sig2) > 0)
+    tgt <- tgt %>% tab_style(cell_text(weight = "bold"),
+                             cells_body(rows = sig2, columns = "Col2"))
+  
+  tgt <- tgt %>%
+    tab_footnote(
+      footnote  = "t-statistikker i parentes. Fed angiver signifikans ved 5% niveau.",
+      locations = cells_title(groups = "title")
+    ) %>%
+    opt_table_font(font = "Arial") %>%
+    tab_options(
+      table.font.size         = 12,
+      heading.title.font.size = 14,
+      column_labels.font.weight = "bold",
+      data_row.padding        = px(1)
+    )
+  
+  print(tgt)
+  invisible(tgt)
+}
+
+# ── HJÆLPEFUNKTION 2: Byg BAB fra data_prop1-lignende datasæt ────────────────
+
+build_bab_rank <- function(data_p) {
+  bab_list     <- list()
+  alle_maaned  <- sort(unique(data_p$year_month))
+  for (i in seq_along(alle_maaned)) {
+    hold_m   <- alle_maaned[i]
+    aktier_i <- data_p %>%
+      filter(year_month == hold_m,
+             !is.na(beta_sort), is.finite(beta_sort),
+             !is.na(ret_m), !is.na(rf_m))
+    if (nrow(aktier_i) < 2) next
+    aktier_i <- aktier_i %>%
+      mutate(
+        z     = rank(beta_sort),
+        z_bar = mean(z),
+        k     = 2 / sum(abs(z - z_bar)),
+        w_H   = pmax(k * (z - z_bar), 0),
+        w_L   = pmax(k * (z_bar - z), 0)
+      )
+    r_L    <- sum(aktier_i$w_L * aktier_i$ret_m)
+    r_H    <- sum(aktier_i$w_H * aktier_i$ret_m)
+    beta_L <- sum(aktier_i$w_L * aktier_i$beta_sort)
+    beta_H <- sum(aktier_i$w_H * aktier_i$beta_sort)
+    if (beta_L <= 0 | beta_H <= 0) next
+    rf_val    <- first(aktier_i$rf_m)
+    bab_exc_m <- (1 / beta_L) * (r_L - rf_val) - (1 / beta_H) * (r_H - rf_val)
+    bab_list[[i]] <- data.frame(
+      year_month = hold_m, bab_exc_m = bab_exc_m,
+      mkt_exc_m  = first(aktier_i$mkt_exc_m),
+      rf_m = rf_val, beta_L = beta_L, beta_H = beta_H
+    )
+  }
+  bind_rows(bab_list) %>% arrange(year_month) %>% filter(!is.na(bab_exc_m))
+}
+
+# ── HJÆLPEFUNKTION 3: Beta → månedlig data_prop1 pipeline ────────────────────
+# Bruges af varianterne der genberegner beta fra bunden
+
+build_data_prop1_from_daglig <- function(daglig_v, aktie_maaned_v) {
+  beta_m <- daglig_v %>%
+    filter(!is.na(beta_exante)) %>%
+    mutate(year_month = format(date, "%Y-%m")) %>%
+    group_by(id, year_month) %>%
+    summarise(beta_sort = last(beta_exante), .groups = "drop") %>%
+    mutate(year_month = format(
+      as.Date(paste0(year_month, "-01")) %m+% months(1), "%Y-%m"
+    ))
+  aktie_maaned_v %>%
+    left_join(beta_m, by = c("id", "year_month")) %>%
+    filter(!is.na(beta_sort), !is.na(ret_exc_m), !is.na(mkt_exc_m),
+           is.finite(beta_sort)) %>%
+    group_by(year_month) %>%
+    mutate(beta_decil = assign_deciles(beta_sort)) %>%
+    ungroup()
+}
+
+# =============================================================================
+# VARIANT 1: Ekskludering af de 10% mindste virksomheder (market equity)
+# =============================================================================
+cat("\n=== Variant 1: Ekskludering af 10% mindste ME ===\n")
+
+daglig_v1 <- daglig %>%
+  group_by(date) %>%
+  filter(me > quantile(me, 0.10, na.rm = TRUE)) %>%
+  ungroup()
+
+# Genberegn markedsafkast og rf på det filtrerede univers
+rf_d_v1 <- daglig_v1 %>%
+  filter(!is.na(ret_d), !is.na(ret_exc_d)) %>%
+  group_by(date) %>%
+  summarise(rf_d = mean(ret_d - ret_exc_d, na.rm = TRUE), .groups = "drop")
+
+mkt_d_v1 <- daglig_v1 %>%
+  group_by(date) %>%
+  summarise(
+    mkt_ret_d = { v <- !is.na(ret_d) & !is.na(me) & me > 0
+    if (sum(v) == 0) NA_real_ else weighted.mean(ret_d[v], me[v]) },
+    .groups = "drop"
+  ) %>%
+  left_join(rf_d_v1, by = "date") %>%
+  mutate(mkt_exc_d = mkt_ret_d - rf_d)
+
+daglig_v1 <- daglig_v1 %>%
+  select(-any_of(c("rf_d","mkt_ret_d","mkt_exc_d"))) %>%
+  left_join(rf_d_v1, by = "date") %>%
+  left_join(mkt_d_v1 %>% select(date, mkt_ret_d, mkt_exc_d), by = "date") %>%
+  group_by(id) %>%
+  mutate(beta_ts = ex_ante_beta(ret_exc_d, mkt_exc_d)) %>%
+  ungroup() %>%
+  mutate(beta_exante = ifelse(!is.na(beta_ts),
+                              w_fast * beta_ts + (1 - w_fast) * 1, NA_real_))
+
+mkt_exc_m_v1 <- mkt_d_v1 %>% filter(!is.na(mkt_exc_d)) %>%
+  mutate(year_month = format(date, "%Y-%m")) %>%
+  group_by(year_month) %>%
+  summarise(mkt_exc_m = prod(1 + mkt_exc_d) - 1, .groups = "drop")
+
+rf_m_v1 <- rf_d_v1 %>% filter(!is.na(rf_d)) %>%
+  mutate(year_month = format(date, "%Y-%m")) %>%
+  group_by(year_month) %>%
+  summarise(rf_m = prod(1 + rf_d) - 1, .groups = "drop")
+
+aktie_m_v1 <- daglig_v1 %>%
+  mutate(year_month = format(date, "%Y-%m")) %>%
+  group_by(id, year_month) %>%
+  summarise(
+    ret_exc_m = { v <- !is.na(ret_exc_d); if (sum(v)==0) NA_real_ else prod(1+ret_exc_d[v])-1 },
+    ret_m     = { v <- !is.na(ret_d);     if (sum(v)==0) NA_real_ else prod(1+ret_d[v])-1 },
+    me_m      = { v <- me[!is.na(me)&me>0]; if (length(v)==0) NA_real_ else last(v) },
+    .groups = "drop"
+  ) %>%
+  left_join(mkt_exc_m_v1, by = "year_month") %>%
+  left_join(rf_m_v1,      by = "year_month")
+
+data_v1  <- build_data_prop1_from_daglig(daglig_v1, aktie_m_v1)
+bab_v1   <- build_bab_rank(data_v1)
+run_prop3_tabel(bab_v1, "Proposition 3 — Ekskludering af 10% mindste ME")
+
+# =============================================================================
+# VARIANT 2: Simple afkast
+# =============================================================================
+cat("\n=== Variant 2: Simple afkast ===\n")
+
+ex_ante_beta_simple <- function(ret_exc_d, mkt_exc_d,
+                                vol_window = 252, vol_min = 120,
+                                corr_window = 5 * 252, corr_min = 750) {
+  n <- length(ret_exc_d)
+  betas <- rep(NA_real_, n)
+  if (n <= corr_window) return(betas)
+  
+  simple3_i <- rep(NA_real_, n)
+  simple3_m <- rep(NA_real_, n)
+  for (j in 1:(n - 2)) {
+    if (!is.na(ret_exc_d[j]) && !is.na(ret_exc_d[j+1]) && !is.na(ret_exc_d[j+2]))
+      simple3_i[j] <- (1+ret_exc_d[j])*(1+ret_exc_d[j+1])*(1+ret_exc_d[j+2]) - 1
+    if (!is.na(mkt_exc_d[j]) && !is.na(mkt_exc_d[j+1]) && !is.na(mkt_exc_d[j+2]))
+      simple3_m[j] <- (1+mkt_exc_d[j])*(1+mkt_exc_d[j+1])*(1+mkt_exc_d[j+2]) - 1
+  }
+  for (i in (corr_window + 1):n) {
+    vol_idx <- max(1, i - vol_window):(i - 1)
+    mi <- !is.na(ret_exc_d[vol_idx]); mm <- !is.na(mkt_exc_d[vol_idx])
+    if (sum(mi) < vol_min || sum(mm) < vol_min) next
+    sigma_i <- sd(ret_exc_d[vol_idx][mi])
+    sigma_m <- sd(mkt_exc_d[vol_idx][mm])
+    if (is.na(sigma_m) || sigma_m == 0) next
+    ci <- max(1, i - corr_window):(i - 1)
+    cm <- !is.na(simple3_i[ci]) & !is.na(simple3_m[ci])
+    if (sum(cm) < corr_min) next
+    rho <- cor(simple3_i[ci][cm], simple3_m[ci][cm])
+    betas[i] <- rho * (sigma_i / sigma_m)
+  }
+  return(betas)
+}
+
+daglig_v2 <- daglig %>%
+  group_by(id) %>%
+  mutate(beta_ts = ex_ante_beta_simple(ret_exc_d, mkt_exc_d)) %>%
+  ungroup() %>%
+  mutate(beta_exante = ifelse(!is.na(beta_ts),
+                              w_fast * beta_ts + (1 - w_fast) * 1, NA_real_))
+
+data_v2 <- build_data_prop1_from_daglig(daglig_v2, aktie_måned)
+bab_v2  <- build_bab_rank(data_v2)
+run_prop3_tabel(bab_v2, "Proposition 3 — Simple afkast")
+
+# =============================================================================
+# VARIANT 3: EWMA beta (lambda = 0.97)
+# =============================================================================
+cat("\n=== Variant 3: EWMA beta (lambda = 0.97) ===\n")
+
+daglig_v3 <- daglig %>%
+  group_by(id) %>%
+  mutate(beta_ts = ex_ante_beta_ewma(ret_exc_d, mkt_exc_d, lambda = 0.97)) %>%
+  ungroup() %>%
+  mutate(beta_exante = ifelse(!is.na(beta_ts),
+                              w_fast * beta_ts + (1 - w_fast) * 1, NA_real_))
+
+data_v3 <- build_data_prop1_from_daglig(daglig_v3, aktie_måned)
+bab_v3  <- build_bab_rank(data_v3)
+run_prop3_tabel(bab_v3, "Proposition 3 — EWMA beta (lambda = 0.97)")
+
+# =============================================================================
+# VARIANT 4: Værdivægtet BAB
+# =============================================================================
+cat("\n=== Variant 4: Vaerdivægtet BAB ===\n")
+
+build_bab_value <- function(data_p) {
+  bab_list    <- list()
+  alle_maaned <- sort(unique(data_p$year_month))
+  for (i in seq_along(alle_maaned)) {
+    hold_m   <- alle_maaned[i]
+    aktier_i <- data_p %>%
+      filter(year_month == hold_m,
+             !is.na(beta_sort), is.finite(beta_sort),
+             !is.na(ret_m), !is.na(rf_m))
+    if (nrow(aktier_i) < 2) next
+    med_beta <- median(aktier_i$beta_sort)
+    aktier_i <- aktier_i %>%
+      mutate(
+        side    = ifelse(beta_sort <= med_beta, "L", "H"),
+        me_safe = ifelse(!is.na(me_m) & me_m > 0, me_m, NA_real_),
+        w_L     = ifelse(side == "L" & !is.na(me_safe),
+                         me_safe / sum(me_safe[side == "L"], na.rm = TRUE), 0),
+        w_H     = ifelse(side == "H" & !is.na(me_safe),
+                         me_safe / sum(me_safe[side == "H"], na.rm = TRUE), 0)
+      )
+    if (sum(aktier_i$side=="L") < 2 | sum(aktier_i$side=="H") < 2) next
+    r_L    <- sum(aktier_i$w_L * aktier_i$ret_m, na.rm = TRUE)
+    r_H    <- sum(aktier_i$w_H * aktier_i$ret_m, na.rm = TRUE)
+    beta_L <- sum(aktier_i$w_L * aktier_i$beta_sort, na.rm = TRUE)
+    beta_H <- sum(aktier_i$w_H * aktier_i$beta_sort, na.rm = TRUE)
+    if (beta_L <= 0 | beta_H <= 0) next
+    rf_val    <- first(aktier_i$rf_m)
+    bab_exc_m <- (1 / beta_L) * (r_L - rf_val) - (1 / beta_H) * (r_H - rf_val)
+    bab_list[[i]] <- data.frame(
+      year_month = hold_m, bab_exc_m = bab_exc_m,
+      mkt_exc_m  = first(aktier_i$mkt_exc_m),
+      rf_m = rf_val, beta_L = beta_L, beta_H = beta_H
+    )
+  }
+  bind_rows(bab_list) %>% arrange(year_month) %>% filter(!is.na(bab_exc_m))
+}
+
+# Bruger original data_prop1 (fra Prop1) med værdivægtet BAB-konstruktion
+bab_v4 <- build_bab_value(data_prop1)
+run_prop3_tabel(bab_v4, "Proposition 3 — Vaerdivægtet BAB")
+
+# =============================================================================
+# VARIANT 5: Varierende shrinkage (Vasicek)
+# =============================================================================
+cat("\n=== Variant 5: Varierende shrinkage (Vasicek) ===\n")
+
+# Kræver sigma2_xs og sigma2_ts på daglig (beregnet i original Prop1)
+daglig_v5 <- daglig %>%
+  mutate(beta_exante = ifelse(
+    !is.na(beta_ts) & !is.na(sigma2_xs) & !is.na(sigma2_ts) &
+      (sigma2_xs + sigma2_ts) > 0,
+    (sigma2_xs / (sigma2_xs + sigma2_ts)) * beta_ts +
+      (1 - sigma2_xs / (sigma2_xs + sigma2_ts)) * 1,
+    NA_real_
+  ))
+
+data_v5 <- build_data_prop1_from_daglig(daglig_v5, aktie_måned)
+bab_v5  <- build_bab_rank(data_v5)
+run_prop3_tabel(bab_v5, "Proposition 3 — Varierende shrinkage (Vasicek)")
+
+# =============================================================================
+# PROP 3 SAMMENLIGNINGSTABEL — 5-variabel regression for hver stresstest
+#
+# Forudsætter at bab_v1–bab_v5 og euribor_ois er defineret
+# =============================================================================
+
+run_prop3_reg5 <- function(bab_ret) {
+  p3 <- bab_ret %>%
+    filter(year_month >= "1994-01" & year_month <= "2021-12") %>%
+    mutate(beta_spread = (beta_H - beta_L) / (beta_H * beta_L)) %>%
+    left_join(euribor_ois %>% select(year_month, euribor_ois), by = "year_month") %>%
+    arrange(year_month) %>%
+    mutate(
+      lag_ted         = lag(euribor_ois),
+      change_ted      = euribor_ois - lag(euribor_ois),
+      lag_bab         = lag(bab_exc_m),
+      lag_beta_spread = lag(beta_spread),
+      z_lag_ted         = as.numeric(scale(lag_ted)),
+      z_change_ted      = as.numeric(scale(change_ted)),
+      z_lag_beta_spread = as.numeric(scale(lag_beta_spread)),
+      z_lag_bab         = as.numeric(scale(lag_bab)),
+      z_mkt             = as.numeric(scale(mkt_exc_m))
+    ) %>%
+    filter(!is.na(lag_ted) & !is.na(change_ted))
+  
+  mod <- lm(bab_exc_m ~ z_lag_ted + z_change_ted +
+              z_lag_beta_spread + z_lag_bab + z_mkt, data = p3)
+  coefs <- summary(mod)$coefficients
+  
+  vars <- c("z_lag_ted", "z_change_ted", "z_lag_beta_spread", "z_lag_bab", "z_mkt")
+  list(
+    est = setNames(coefs[vars, 1], vars),
+    tst = setNames(coefs[vars, 3], vars)
+  )
+}
+
+# ── Kør regression for hver variant ──────────────────────────────────────────
+
+varianter <- list(
+  list(navn = "10% mindste ME ekskluderet", bab = bab_v1),
+  list(navn = "Simple afkast",              bab = bab_v2),
+  list(navn = "EWMA (lambda = 0.97)",       bab = bab_v3),
+  list(navn = "Varierende shrinkage",       bab = bab_v5),
+  list(navn = "Værdivægtet BAB",           bab = bab_v4)
+)
+
+# ── Byg display-data frame (koefficient + t-stat som separate rækker) ─────────
+
+col_labels <- c(
+  "z_lag_ted"         = "TED lag",
+  "z_change_ted"      = "ΔTED",
+  "z_lag_beta_spread" = "BetaSpread",
+  "z_lag_bab"         = "BAB lag",
+  "z_mkt"             = "Markedsafkast"
+)
+
+rows <- list()
+for (v in varianter) {
+  res <- run_prop3_reg5(v$bab)
+  # Koefficient-række
+  rows[[length(rows) + 1]] <- c(
+    Navn = v$navn,
+    type = "est",
+    setNames(sprintf("%.4f", res$est), names(res$est))
+  )
+  # t-stat-række
+  rows[[length(rows) + 1]] <- c(
+    Navn = "",
+    type = "tst",
+    setNames(sprintf("(%.4f)", res$tst), names(res$tst))
+  )
+}
+
+display_df <- as.data.frame(do.call(rbind, rows), stringsAsFactors = FALSE)
+
+# Signifikans: fed på koefficient-rækker hvor |t| > 1.96
+sig_matrix <- matrix(FALSE, nrow = nrow(display_df), ncol = 5)
+for (i in seq(1, nrow(display_df) - 1, by = 2)) {
+  trow <- display_df[i + 1, 3:7]
+  tvals <- as.numeric(gsub("[()]", "", trow))
+  sig_matrix[i, ] <- abs(tvals) > 1.96
+}
+
+# ── gt-tabel ──────────────────────────────────────────────────────────────────
+
+tbl_df <- display_df %>%
+  select(-type) %>%
+  rename(
+    `Variant`       = Navn,
+    `TED lag`       = z_lag_ted,
+    `ΔTED`          = z_change_ted,
+    `BetaSpread`    = z_lag_beta_spread,
+    `BAB lag`       = z_lag_bab,
+    `Markedsafkast` = z_mkt
+  )
+
+tbl_gt <- tbl_df %>%
+  gt(rowname_col = "Variant") %>%
+  cols_align(align = "right",  columns = c(`TED lag`, `ΔTED`, `BetaSpread`, `BAB lag`, `Markedsafkast`)) %>%
+  cols_align(align = "left",   columns = Variant) %>%
+  
+  tab_style(
+    style     = cell_borders(sides = "top", color = "black", weight = px(1.5)),
+    locations = list(cells_column_labels(), cells_stubhead())
+  ) %>%
+  tab_style(
+    style     = cell_borders(sides = "bottom", color = "black", weight = px(1.5)),
+    locations = list(cells_column_labels(), cells_stubhead())
+  ) %>%
+  tab_style(
+    style     = cell_borders(sides = "bottom", color = "black", weight = px(1.5)),
+    locations = list(cells_body(rows = nrow(tbl_df)),
+                     cells_stub(rows = nrow(tbl_df)))
+  ) %>%
+  tab_style(
+    style     = cell_borders(sides = "bottom", color = "black", weight = px(0.7)),
+    locations = list(
+      cells_body(rows = seq(2, nrow(tbl_df) - 2, by = 2)),
+      cells_stub(rows = seq(2, nrow(tbl_df) - 2, by = 2))
+    )
+  ) %>%
+  tab_style(
+    style     = cell_fill(color = "#f5f5f5"),
+    locations = list(
+      cells_body(rows = seq(2, nrow(tbl_df), by = 2)),
+      cells_stub(rows = seq(2, nrow(tbl_df), by = 2))
+    )
+  ) %>%
+  tab_style(
+    style     = cell_text(weight = "bold"),
+    locations = cells_column_labels()
+  ) %>%
+  opt_table_font(font = "Arial") %>%
+  tab_options(
+    table.font.size           = 12,
+    column_labels.font.weight = "bold",
+    stub.font.weight          = "bold",
+    data_row.padding          = px(2)
+  )
+
+# Tilføj fed skrift for signifikante koefficienter
+var_cols <- c("TED lag", "ΔTED", "BetaSpread", "BAB lag", "Markedsafkast")
+for (i in seq(1, nrow(display_df) - 1, by = 2)) {
+  for (j in 1:5) {
+    if (sig_matrix[i, j]) {
+      tbl_gt <- tbl_gt %>%
+        tab_style(
+          style     = cell_text(weight = "bold"),
+          locations = cells_body(rows = i, columns = var_cols[j])
+        )
+    }
+  }
+}
+
+print(tbl_gt)
