@@ -1,0 +1,234 @@
+# =========================
+# PROPOSITION 3: Finansieringschok og afkast på BAB (F&P Tabel 9)
+# =========================
+
+# ── STEG 1: Klargør EURIBOR og OIS data ─────────────────────────────────────
+
+euribor_clean <- data.frame(
+  date    = as.Date(EURIBOR[[1]]),
+  euribor = as.numeric(EURIBOR[[3]])
+) %>%
+  mutate(year_month = format(date, "%Y-%m")) %>%
+  select(year_month, euribor)
+
+ois_clean <- data.frame(
+  date  = as.Date(OIS[[1]]),
+  eonia = as.numeric(OIS[[3]])
+) %>%
+  mutate(year_month = format(date, "%Y-%m")) %>%
+  select(year_month, eonia)
+
+euribor_ois <- euribor_clean %>%
+  left_join(ois_clean, by = "year_month") %>%
+  mutate(euribor_ois = euribor - eonia) %>%
+  filter(!is.na(euribor_ois))
+
+# ── STEG 2: Merge alle variable ──────────────────────────────────────────────
+
+prop3_data <- bab_returns %>%
+  filter(year_month >= "1994-01" & year_month <= "2021-12") %>%
+  mutate(beta_spread = (beta_H - beta_L) / (beta_H * beta_L)) %>%
+  left_join(euribor_ois %>% select(year_month, euribor_ois), by = "year_month")
+
+
+# ── STEG 3: Konstruer forklarende variable ──────────────────────────────────
+prop3_data <- prop3_data %>%
+  arrange(year_month) %>%
+  mutate(
+    # hovedvariable
+    lag_ted           = lag(euribor_ois),               
+    change_ted        = euribor_ois - lag(euribor_ois),      
+    # kontrolvariable
+    lag_bab           = lag(bab_exc_m),                 
+    lag_beta_spread   = lag(beta_spread),         
+    # Normaliserede variable til regression
+    z_lag_ted         = as.numeric(scale(lag_ted)),
+    z_change_ted      = as.numeric(scale(change_ted)),
+    z_lag_beta_spread = as.numeric(scale(lag_beta_spread)),
+    z_lag_bab         = as.numeric(scale(lag_bab)),
+    z_mkt             = as.numeric(scale(mkt_exc_m))
+  ) %>%
+  filter(!is.na(lag_ted) & !is.na(change_ted))
+
+# ── STEG 4: Tabel 9 regressioner ─────────────────────────────────────────────
+
+# Kolonne (1): Kun lagged TED + change in TED
+model_1 <- lm(bab_exc_m ~ z_lag_ted + z_change_ted, data = prop3_data)
+
+# Kolonne (2): Med kontrolvariable
+model_2 <- lm(bab_exc_m ~ z_lag_ted + z_change_ted +
+                z_lag_beta_spread + z_lag_bab + z_mkt,
+              data = prop3_data)
+
+# ── STEG 5: Formater output som Tabel ───────────────────────────
+
+# Hjælpefunktion til at trække koefficient og t-stat fra model
+get_stat <- function(model, var_name) {
+  coefs <- summary(model)$coefficients
+  if (var_name %in% rownames(coefs)) {
+    list(est = coefs[var_name, 1], tst = coefs[var_name, 3])
+  } else {
+    list(est = NA_real_, tst = NA_real_)
+  }
+}
+
+# Variable
+vars <- list(
+  list(label = "Lagged EURIBOR-OIS spread",    z = "z_lag_ted"),
+  list(label = "Change in EURIBOR-OIS spread", z = "z_change_ted"),
+  list(label = "Beta spread",          z = "z_lag_beta_spread"),
+  list(label = "Lagged BAB return",    z = "z_lag_bab"),
+  list(label = "Market return",        z = "z_mkt")
+)
+
+# Byg data.frame med koefficienter og t-stats som separate rækker
+rows <- list()
+for (v in vars) {
+  s1 <- get_stat(model_1, v$z)
+  s2 <- get_stat(model_2, v$z)
+  # Koefficient-række
+  rows[[length(rows) + 1]] <- data.frame(
+    Variable = v$label, type = "est",
+    Col1 = s1$est, Col2 = s2$est, stringsAsFactors = FALSE
+  )
+  # t-stat-række
+  rows[[length(rows) + 1]] <- data.frame(
+    Variable = "", type = "tst",
+    Col1 = s1$tst, Col2 = s2$tst, stringsAsFactors = FALSE
+  )
+}
+tabel9_df <- bind_rows(rows)
+
+# Tilføj bundlinjer
+tabel9_df <- bind_rows(
+  tabel9_df,
+  data.frame(Variable = "Number of observations", type = "info",
+             Col1 = nrow(prop3_data), Col2 = nrow(prop3_data)),
+  data.frame(Variable = "Adjusted R²", type = "info",
+             Col1 = summary(model_1)$adj.r.squared,
+             Col2 = summary(model_2)$adj.r.squared)
+)
+
+# Formater: t-stats i parentes
+tabel9_display <- tabel9_df %>%
+  mutate(
+    Col1_fmt = case_when(
+      type == "tst" & !is.na(Col1) ~ sprintf("(%.2f)", Col1),
+      type == "info" & Variable == "Number of observations" ~ sprintf("%.0f", Col1),
+      type == "info" & Variable == "Adjusted R²" ~ sprintf("%.3f", Col1),
+      !is.na(Col1) ~ sprintf("%.3f", Col1),
+      TRUE ~ ""
+    ),
+    Col2_fmt = case_when(
+      type == "tst" & !is.na(Col2) ~ sprintf("(%.2f)", Col2),
+      type == "info" & Variable == "Number of observations" ~ sprintf("%.0f", Col2),
+      type == "info" & Variable == "Adjusted R²" ~ sprintf("%.3f", Col2),
+      !is.na(Col2) ~ sprintf("%.3f", Col2),
+      TRUE ~ ""
+    )
+  ) %>%
+  select(Variable, Col1 = Col1_fmt, Col2 = Col2_fmt)
+
+# Find signifikante celler (for fed skrift)
+sig_rows_1 <- which(tabel9_df$type == "est" & !is.na(tabel9_df$Col1) &
+                      abs(lead(tabel9_df$Col1)) > 1.96)
+sig_rows_2 <- which(tabel9_df$type == "est" & !is.na(tabel9_df$Col2) &
+                      abs(lead(tabel9_df$Col2)) > 1.96)
+
+# tabel
+tabel9_gt <- tabel9_display %>%
+  gt() %>%
+  cols_label(
+    Variable = "",
+    Col1     = "(1)",
+    Col2     = "(2)"
+  ) %>%
+  cols_align(align = "right",   columns = c(Col1, Col2)) %>%
+  cols_align(align = "left",    columns = Variable) %>%
+  tab_style(
+    style     = cell_borders(sides = "all", style = "hidden"),
+    locations = cells_body()
+  )
+
+# Fed skrift for signifikante koefficienter i kolonne 1
+if (length(sig_rows_1) > 0) {
+  tabel9_gt <- tabel9_gt %>%
+    tab_style(
+      style     = cell_text(weight = "bold"),
+      locations = cells_body(rows = sig_rows_1, columns = "Col1")
+    )
+}
+
+# Fed skrift for signifikante koefficienter i kolonne 2
+if (length(sig_rows_2) > 0) {
+  tabel9_gt <- tabel9_gt %>%
+    tab_style(
+      style     = cell_text(weight = "bold"),
+      locations = cells_body(rows = sig_rows_2, columns = "Col2")
+    )
+}
+
+tabel9_gt <- tabel9_gt %>%
+  tab_footnote(
+    footnote  = "t-statistikker i parentes. Fed angiver signifikans ved 5% niveau.",
+    locations = cells_title(groups = "title")
+  ) %>%
+  opt_table_font(font = "Arial") %>%
+  tab_options(
+    table.font.size           = 12,
+    heading.title.font.size   = 14,
+    column_labels.font.weight = "bold",
+    data_row.padding = px(1)
+  )
+
+print(tabel9_gt)
+
+# ── STEG 6: Plots ────────────────────────────────────────────────────────────
+
+# Plot 1: BAB vs lagget Euribor-OIS spread
+p1 <- ggplot(prop3_data, aes(x = lag_ted, y = bab_exc_m)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+  labs(title = "BAB-merafkast vs lagget Euribor-OIS spread",
+       subtitle = "Negativ sammenhæng forudsagt af Proposition 3",
+       x = "Lagget EURIBOR-OIS spread",
+       y = "BAB merafkast (t)") +
+  theme_minimal()
+print(p1)
+
+# Plot 2: BAB vs change in Euribor-OIS spread
+p2 <- ggplot(prop3_data, aes(x = change_ted, y = bab_exc_m)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = TRUE, color = "blue") +
+  labs(title = "BAB-merafkast vs ændring i Euribor-OIS spread",
+       subtitle = "Negativ sammenhæng forudsagt af Proposition 3",
+       x = "Ændring i EURIBOR-OIS spread (t-1 til t)",
+       y = "BAB merafkast (t)") +
+  theme_minimal()
+print(p2)
+
+# Plot 3: Tidsserie af BAB og Euribor-OIS spread
+prop3_ts <- prop3_data %>%
+  select(year_month, bab_exc_m, euribor_ois) %>%
+  mutate(
+    bab_scaled = as.numeric(scale(bab_exc_m)),
+    ted_scaled = as.numeric(scale(euribor_ois))
+  ) %>%
+  pivot_longer(cols = c(bab_scaled, ted_scaled),
+               names_to  = "serie",
+               values_to = "værdi") %>%
+  mutate(serie = recode(serie,
+                        "bab_scaled" = "BAB merafkast (skaleret)",
+                        "ted_scaled" = "EURIBOR-OIS spread (skaleret)"))
+
+p3 <- ggplot(prop3_ts,
+             aes(x = as.Date(paste0(year_month, "-01")),
+                 y = værdi, color = serie)) +
+  geom_line(alpha = 0.8) +
+  scale_color_manual(values = c("BAB merafkast (skaleret)"      = "#2196F3",
+                                "EURIBOR-OIS spread (skaleret)" = "#f85149")) +
+  labs(title = "BAB-merafkast og EURIBOR-OIS spread (1994-2022)",
+       x = "år", y = "Skaleret værdi", color = "") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+print(p3)
