@@ -1,0 +1,204 @@
+# =============================================================================
+# BAB VÆGTNINGSSAMMENLIGNING: Rangvægtet (F&P) vs Ligevægtet vs Værdivægtet
+# =============================================================================
+
+alle_måneder <- sort(unique(data_prop1$year_month))
+
+# ── Funktion der bygger BAB for en given vægtningsmetode ─────────────────────
+
+build_bab <- function(data, method = c("rank", "equal", "value")) {
+  method <- match.arg(method)
+  bab_list <- list()
+  
+  for (i in seq_along(alle_måneder)) {
+    hold_m <- alle_måneder[i]
+    aktier_i <- data %>%
+      filter(year_month == hold_m,
+             !is.na(beta_sort), is.finite(beta_sort),
+             !is.na(ret_m), !is.na(rf_m))
+    if (nrow(aktier_i) < 2) next   # mindst 2 i hver halvdel
+    
+    if (method == "rank") {
+      # F&P ligning 16 — ingen median-split nødvendig
+      aktier_i <- aktier_i %>%
+        mutate(
+          z     = rank(beta_sort),
+          z_bar = mean(z),
+          k     = 2 / sum(abs(z - z_bar)),
+          w_L   = pmax(k * (z_bar - z), 0),
+          w_H   = pmax(k * (z - z_bar), 0)
+        )
+    } else {
+      # Median-split for EW og VW
+      med_beta <- median(aktier_i$beta_sort)
+      aktier_i <- aktier_i %>%
+        mutate(side = ifelse(beta_sort <= med_beta, "L", "H"))
+      
+      low  <- aktier_i %>% filter(side == "L")
+      high <- aktier_i %>% filter(side == "H")
+      if (nrow(low) < 2 | nrow(high) < 2) next
+      
+      if (method == "equal") {
+        aktier_i <- aktier_i %>%
+          mutate(
+            w_L = ifelse(side == "L", 1 / sum(side == "L"), 0),
+            w_H = ifelse(side == "H", 1 / sum(side == "H"), 0)
+          )
+      } else if (method == "value") {
+        aktier_i <- aktier_i %>%
+          mutate(
+            me_safe = ifelse(!is.na(me_m) & me_m > 0, me_m, NA_real_),
+            w_L = ifelse(side == "L" & !is.na(me_safe),
+                         me_safe / sum(me_safe[side == "L"], na.rm = TRUE), 0),
+            w_H = ifelse(side == "H" & !is.na(me_safe),
+                         me_safe / sum(me_safe[side == "H"], na.rm = TRUE), 0)
+          )
+      }
+    }
+    
+    # Porteføljeafkast (råt)
+    r_L <- sum(aktier_i$w_L * aktier_i$ret_m, na.rm = TRUE)
+    r_H <- sum(aktier_i$w_H * aktier_i$ret_m, na.rm = TRUE)
+    
+    # Porteføljebetaer
+    beta_L <- sum(aktier_i$w_L * aktier_i$beta_sort, na.rm = TRUE)
+    beta_H <- sum(aktier_i$w_H * aktier_i$beta_sort, na.rm = TRUE)
+    if (beta_L <= 0 | beta_H <= 0) next
+    
+    # Risikofri rente
+    rf_val <- first(aktier_i$rf_m)
+    
+    # F&P ligning 17
+    bab_exc <- (1 / beta_L) * (r_L - rf_val) - (1 / beta_H) * (r_H - rf_val)
+    
+    bab_list[[i]] <- data.frame(
+      year_month = hold_m,
+      bab_exc_m  = bab_exc,
+      mkt_exc_m  = first(aktier_i$mkt_exc_m),
+      beta_L     = beta_L,
+      beta_H     = beta_H
+    )
+  }
+  
+  bind_rows(bab_list) %>% arrange(year_month) %>% filter(!is.na(bab_exc_m))
+}
+
+# ── Byg de tre BAB-porteføljer ───────────────────────────────────────────────
+bab_rank  <- build_bab(data_prop1, method = "rank")
+bab_equal <- build_bab(data_prop1, method = "equal")
+bab_value <- build_bab(data_prop1, method = "value")
+
+# ── Beregn statistikker for hver ─────────────────────────────────────────────
+
+compute_stats <- function(bab_ret, label) {
+  mod <- lm(bab_exc_m ~ mkt_exc_m, data = bab_ret)
+  data.frame(
+    Portefølje       = label,
+    Merafkast        = round(mean(bab_ret$bab_exc_m) * 100, 2),
+    t_stat_exc       = round(mean(bab_ret$bab_exc_m) / (sd(bab_ret$bab_exc_m) / sqrt(nrow(bab_ret))), 2),
+    CAPM_alpha       = round(coef(mod)[1] * 100, 2),
+    t_stat_alpha     = round(summary(mod)$coefficients[1, 3], 2),
+    Beta_exante      = 0.00,
+    Beta_realiseret  = round(as.numeric(coef(mod)[2]), 2),
+    Beta_spænd       = round(mean(bab_ret$beta_H - bab_ret$beta_L), 2),
+    Volatilitet      = round(sd(bab_ret$bab_exc_m) * sqrt(12) * 100, 2),
+    Sharpe           = round(mean(bab_ret$bab_exc_m) / sd(bab_ret$bab_exc_m) * sqrt(12), 2)
+  )
+}
+
+stats_rank  <- compute_stats(bab_rank,  "Rangvægtet (F&P)")
+stats_equal <- compute_stats(bab_equal, "Ligevægtet")
+stats_value <- compute_stats(bab_value, "Værdivægtet")
+bab_compare <- bind_rows(stats_rank, stats_equal, stats_value)
+
+
+# ── Kumulativt plot ──────────────────────────────────────────────────────────
+
+bab_plot <- bind_rows(
+  bab_rank  %>% mutate(kum = cumprod(1 + bab_exc_m), metode = "Rangvægtet (F&P)"),
+  bab_equal %>% mutate(kum = cumprod(1 + bab_exc_m), metode = "Ligevægtet"),
+  bab_value %>% mutate(kum = cumprod(1 + bab_exc_m), metode = "Værdivægtet")
+) %>%
+  mutate(dato = as.Date(paste0(year_month, "-01")))
+
+p_vægt <- ggplot(bab_plot, aes(x = dato, y = kum, color = metode)) +
+  geom_line(lwd = 0.7) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray50") +
+  scale_color_manual(values = c(
+    "Rangvægtet (F&P)" = "#2196F3",
+    "Ligevægtet"       = "#4daf4a",
+    "Værdivægtet"      = "#f85149"
+  )) +
+  labs(x = "År", y = "Kumulativt merafkast (indekseret til 1)", color = "Vægtning") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+print(p_vægt)
+
+# ── Sammenligningstabel ──────────────────────────────────────────────────────
+
+# Transponeret: porteføljer som rækker, variable som kolonner
+tabel_df <- data.frame(
+  Metode = bab_compare$Portefølje,
+  Merafkast       = bab_compare$Merafkast,
+  `t-stat`        = bab_compare$t_stat_exc,
+  `CAPM alpha`    = bab_compare$CAPM_alpha,
+  `t-stat.1`      = bab_compare$t_stat_alpha,
+  `Beta (est.)`   = bab_compare$Beta_exante,
+  `Beta (real.)`  = bab_compare$Beta_realiseret,
+  `Beta-spænd`    = bab_compare$Beta_spænd,
+  Volatilitet     = bab_compare$Volatilitet,
+  `Sharpe ratio`  = bab_compare$Sharpe,
+  check.names = FALSE
+)
+
+vægt_gt <- tabel_df %>%
+  gt(rowname_col = "Metode") %>%
+  cols_label(
+    `t-stat`   = "t-stat",
+    `t-stat.1` = "t-stat"
+  ) %>%
+  cols_align(align = "center", columns = everything()) %>%
+  fmt_number(columns = everything(), decimals = 2) %>%
+  tab_style(
+    style = cell_text(v_align = "top", weight = "bold"),
+    locations = cells_column_labels()
+  ) %>%
+  opt_table_font(font = "Arial") %>%
+  tab_options(
+    table.font.size = 12,
+    column_labels.font.weight = "bold",
+    column_labels.border.top.style = "solid",
+    column_labels.border.top.width = px(1),
+    column_labels.border.bottom.style = "solid",
+    column_labels.border.bottom.width = px(1),
+    table_body.border.bottom.style = "solid",
+    table_body.border.bottom.width = px(1),
+    stub.font.weight = "bold"
+  )
+
+# Fed skrift for signifikante værdier
+for (r in 1:nrow(bab_compare)) {
+  if (abs(bab_compare$t_stat_exc[r]) > 1.96) {
+    vægt_gt <- vægt_gt %>%
+      tab_style(style = cell_text(weight = "bold"),
+                locations = cells_body(rows = r, columns = "Merafkast"))
+  }
+  if (abs(bab_compare$t_stat_alpha[r]) > 1.96) {
+    vægt_gt <- vægt_gt %>%
+      tab_style(style = cell_text(weight = "bold"),
+                locations = cells_body(rows = r, columns = "CAPM alpha"))
+  }
+}
+
+print(vægt_gt)
+
+aktier_per_måned <- data_prop1 %>%
+  filter(!is.na(beta_sort), is.finite(beta_sort), !is.na(ret_m), !is.na(rf_m)) %>%
+  group_by(year_month) %>%
+  summarise(
+    med_beta = median(beta_sort),
+    n_long   = sum(beta_sort <= med_beta),
+    n_short  = sum(beta_sort > med_beta),
+    n_total  = n(),
+    .groups  = "drop"
+  )
