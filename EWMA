@@ -1,0 +1,359 @@
+# =============================================================================
+# EWMA EX ANTE BETA — Tre lambda-versioner (0.94, 0.97, 0.99)
+# =============================================================================
+
+# ── EWMA-betafunktion ─────────────────────────────────────────────────────────
+ex_ante_beta_ewma <- function(ret_exc_d, mkt_exc_d,
+                              lambda      = 0.94,
+                              prod_window = 550) {
+  n     <- length(ret_exc_d)
+  betas <- rep(NA_real_, n)
+  
+  if (length(mkt_exc_d) != n) stop("ret_exc_d og mkt_exc_d skal have samme laengde.")
+  
+  valid_obs <- !is.na(ret_exc_d) & !is.na(mkt_exc_d) &
+    ret_exc_d > -1    & mkt_exc_d > -1
+  valid_idx <- which(valid_obs)
+  
+  if (length(valid_idx) < prod_window) return(betas)
+  
+  log_i <- rep(NA_real_, n)
+  log_m <- rep(NA_real_, n)
+  log_i[valid_obs] <- log1p(ret_exc_d[valid_obs])
+  log_m[valid_obs] <- log1p(mkt_exc_d[valid_obs])
+  
+  first  <- valid_idx[1]
+  var_i  <- log_i[first]^2
+  var_m  <- log_m[first]^2
+  cov_im <- log_i[first] * log_m[first]
+  valid_count <- 1L
+  
+  for (j in 2:length(valid_idx)) {
+    curr <- valid_idx[j]
+    prev <- valid_idx[j - 1]
+    
+    var_i  <- lambda * var_i  + (1 - lambda) * log_i[prev]^2
+    var_m  <- lambda * var_m  + (1 - lambda) * log_m[prev]^2
+    cov_im <- lambda * cov_im + (1 - lambda) * log_i[prev] * log_m[prev]
+    valid_count <- valid_count + 1L
+    
+    if (valid_count < prod_window)    next
+    if (is.na(var_m) || var_m <= 0)  next
+    
+    sigma_i <- sqrt(var_i)
+    sigma_m <- sqrt(var_m)
+    if (sigma_i <= 0 || sigma_m <= 0) next
+    
+    rho        <- cov_im / (sigma_i * sigma_m)
+    rho        <- max(min(rho, 1), -1)
+    betas[curr] <- rho * (sigma_i / sigma_m)
+  }
+  return(betas)
+}
+
+# ── Pipeline: returnerer liste med tabel + beta-data til plot ─────────────────
+
+koer_ewma_pipeline <- function(lambda) {
+  
+  # STEG 1-2: beta_ts og shrinkage
+  daglig_ewma <- daglig %>%
+    group_by(id) %>%
+    mutate(beta_ts = ex_ante_beta_ewma(ret_exc_d, mkt_exc_d, lambda = lambda)) %>%
+    ungroup() %>%
+    mutate(beta_exante = ifelse(
+      !is.na(beta_ts),
+      w_fast * beta_ts + (1 - w_fast) * 1,
+      NA_real_
+    ))
+  
+  
+  # STEG 3: Aggreger til maanedsniveau med 1-maaneds lag
+  beta_maaned <- daglig_ewma %>%
+    filter(!is.na(beta_exante)) %>%
+    mutate(year_month = format(date, "%Y-%m")) %>%
+    group_by(id, year_month) %>%
+    summarise(beta_sort = last(beta_exante), .groups = "drop") %>%
+    mutate(year_month = format(
+      as.Date(paste0(year_month, "-01")) %m+% months(1), "%Y-%m"
+    ))
+  
+  # STEG 4-5: Merge og deciler
+  data_p <- aktie_maaned %>%
+    left_join(beta_maaned, by = c("id", "year_month")) %>%
+    filter(!is.na(beta_sort), !is.na(ret_exc_m), !is.na(mkt_exc_m),
+           is.finite(beta_sort)) %>%
+    group_by(year_month) %>%
+    mutate(beta_decil = assign_deciles(beta_sort)) %>%
+    ungroup()
+
+  
+  # STEG 6: Decilportefoeljeafkast
+  port_m <- data_p %>%
+    group_by(year_month, beta_decil) %>%
+    summarise(
+      port_exc_m = mean(ret_exc_m),
+      mkt_exc_m  = first(mkt_exc_m),
+      mean_beta  = mean(beta_sort),
+      n_aktier   = n(),
+      .groups    = "drop"
+    )
+  
+  decil_res <- port_m %>%
+    group_by(beta_decil) %>%
+    summarise(
+      alpha            = coef(lm(port_exc_m ~ mkt_exc_m))[1],
+      alpha_t          = summary(lm(port_exc_m ~ mkt_exc_m))$coefficients[1, 3],
+      real_beta        = coef(lm(port_exc_m ~ mkt_exc_m))[2],
+      mean_beta_exante = mean(mean_beta),
+      mean_exc         = mean(port_exc_m),
+      sd_exc           = sd(port_exc_m),
+      sharpe           = mean(port_exc_m) / sd(port_exc_m) * sqrt(12),
+      n_maaneder       = n(),
+      .groups          = "drop"
+    )
+  
+  # STEG 7: BAB
+  bab_list      <- list()
+  alle_maaneder <- sort(unique(data_p$year_month))
+  
+  for (i in seq_along(alle_maaneder)) {
+    hold_m   <- alle_maaneder[i]
+    aktier_i <- data_p %>%
+      filter(year_month == hold_m,
+             !is.na(beta_sort), is.finite(beta_sort),
+             !is.na(ret_m),     !is.na(rf_m))
+    
+    if (nrow(aktier_i) < 2) next
+    
+    aktier_i <- aktier_i %>%
+      mutate(
+        z         = rank(beta_sort),
+        z_bar     = mean(z),
+        k         = 2 / sum(abs(z - z_bar)),
+        w_H       = pmax(k * (z - z_bar), 0),
+        w_L       = pmax(k * (z_bar - z), 0),
+      )
+    
+    r_L    <- sum(aktier_i$w_L * aktier_i$ret_m)
+    r_H    <- sum(aktier_i$w_H * aktier_i$ret_m)
+    beta_L <- sum(aktier_i$w_L * aktier_i$beta_sort)
+    beta_H <- sum(aktier_i$w_H * aktier_i$beta_sort)
+    
+    if (beta_L <= 0 | beta_H <= 0) next
+    
+    rf_m_i    <- first(aktier_i$rf_m)
+    bab_exc_m <- (1 / beta_L) * (r_L - rf_m_i) - (1 / beta_H) * (r_H - rf_m_i)
+    
+    bab_list[[i]] <- data.frame(
+      year_month = hold_m,
+      bab_exc_m  = bab_exc_m,
+      mkt_exc_m  = first(aktier_i$mkt_exc_m),
+      rf_m       = rf_m_i,
+      beta_L     = beta_L,
+      beta_H     = beta_H
+    )
+  }
+  
+  bab_ret <- bind_rows(bab_list) %>%
+    arrange(year_month) %>%
+    filter(!is.na(bab_exc_m))
+  
+  bab_mod   <- lm(bab_exc_m ~ mkt_exc_m, data = bab_ret)
+  bab_alpha <- coef(bab_mod)[1]
+  bab_at    <- summary(bab_mod)$coefficients[1, 3]
+  bab_sr    <- mean(bab_ret$bab_exc_m) / sd(bab_ret$bab_exc_m) * sqrt(12)
+  
+  # STEG 8: gt-tabel
+  decil_tbl <- decil_res %>%
+    mutate(
+      t_excess     = mean_exc / (sd_exc / sqrt(n_maaneder)),
+      volatility   = sd_exc * sqrt(12) * 100,
+      mean_exc_pct = mean_exc * 100,
+      alpha_pct    = alpha    * 100
+    )
+  
+  bab_stats <- data.frame(
+    mean_exc_pct     = mean(bab_ret$bab_exc_m) * 100,
+    t_excess         = mean(bab_ret$bab_exc_m) /
+      (sd(bab_ret$bab_exc_m) / sqrt(nrow(bab_ret))),
+    alpha_pct        = bab_alpha * 100,
+    alpha_t          = bab_at,
+    mean_beta_exante = 0.00,
+    real_beta        = coef(bab_mod)[2],
+    volatility       = sd(bab_ret$bab_exc_m) * sqrt(12) * 100,
+    sharpe           = bab_sr
+  )
+  
+  tdf <- data.frame(
+    Metric = c("Merafkast", "t-stat", "CAPM alpha", "t-stat",
+               "Beta (ex ante)", "Beta (realiseret)", "Volatilitet", "Sharpe ratio")
+  )
+  for (d in 1:10) {
+    r <- decil_tbl %>% filter(beta_decil == d)
+    tdf[[paste0("P", d)]] <- c(
+      r$mean_exc_pct, r$t_excess, r$alpha_pct, r$alpha_t,
+      r$mean_beta_exante, r$real_beta, r$volatility, r$sharpe
+    )
+  }
+  tdf[["BAB"]] <- c(
+    bab_stats$mean_exc_pct, bab_stats$t_excess,
+    bab_stats$alpha_pct,    bab_stats$alpha_t,
+    bab_stats$mean_beta_exante, bab_stats$real_beta,
+    bab_stats$volatility,   bab_stats$sharpe
+  )
+  tdf <- tdf %>% mutate(across(where(is.numeric), ~ round(., 2)))
+  
+  sig_exc <- c(paste0("P", 1:10), "BAB")[
+    abs(c(decil_tbl$t_excess, bab_stats$t_excess)) > 1.96
+  ]
+  sig_alp <- c(paste0("P", 1:10), "BAB")[
+    abs(c(decil_tbl$alpha_t, bab_stats$alpha_t)) > 1.96
+  ]
+  
+  tgt <- tdf %>%
+    gt(rowname_col = "Metric") %>%
+    cols_label(
+      P1  = html("P1<br>(lav beta)"),
+      P2  = html("P2<br>&nbsp;"), P3  = html("P3<br>&nbsp;"),
+      P4  = html("P4<br>&nbsp;"), P5  = html("P5<br>&nbsp;"),
+      P6  = html("P6<br>&nbsp;"), P7  = html("P7<br>&nbsp;"),
+      P8  = html("P8<br>&nbsp;"), P9  = html("P9<br>&nbsp;"),
+      P10 = html("P10<br>(høj beta)"),
+      BAB = html("BAB<br>&nbsp;")
+    ) %>%
+    cols_align(align = "center", columns = c(P1:P10, BAB)) %>%
+    cols_width(
+      Metric ~ px(110), P1 ~ px(70), P2:P9 ~ px(45), P10 ~ px(70), BAB ~ px(56)
+    ) %>%
+    tab_style(
+      style     = cell_borders(sides = "top", color = "#cccccc", weight = px(1.5)),
+      locations = list(cells_column_labels(), cells_stubhead())
+    ) %>%
+    tab_style(
+      style     = cell_text(v_align = "top", weight = "bold"),
+      locations = cells_column_labels()
+    ) %>%
+    tab_style(
+      style     = cell_fill(color = "#f5f5f5"),
+      locations = cells_body(rows = Metric == "t-stat")
+    ) %>%
+    fmt_number(columns = everything(), decimals = 2)
+  
+  if (length(sig_exc) > 0)
+    tgt <- tgt %>% tab_style(cell_text(weight = "bold"),
+                             cells_body(rows = "Merafkast", columns = sig_exc))
+  if (length(sig_alp) > 0)
+    tgt <- tgt %>% tab_style(cell_text(weight = "bold"),
+                             cells_body(rows = "CAPM alpha", columns = sig_alp))
+  
+  tgt <- tgt %>%
+    opt_table_font(font = "Arial") %>%
+    tab_options(
+      table.font.size           = 12,
+      heading.title.font.size   = 14,
+      column_labels.font.weight = "bold",
+      stub.font.weight          = "bold"
+    )
+  
+  print(tgt)
+  
+  # Returner beta-data til fordelingsplot
+  invisible(
+    daglig_ewma %>%
+      filter(!is.na(beta_exante)) %>%
+      transmute(beta   = beta_exante,
+                metode = sprintf("EWMA (lambda = %.2f)", lambda))
+  )
+}
+
+# ── Kør pipeline for alle tre lambda — gem beta-data til plot ─────────────────
+
+beta_plot_list <- list()
+for (lam in c(0.94, 0.97, 0.99)) {
+  beta_plot_list[[as.character(lam)]] <- koer_ewma_pipeline(lam)
+}
+
+# ── Fordelingsplot: Rullende vindue + tre EWMA ────────────────────────────────
+
+beta_plot_data <- bind_rows(
+  daglig %>%
+    filter(!is.na(beta_exante)) %>%
+    transmute(beta = beta_exante, metode = "Rullende vindue"),
+  beta_plot_list[["0.94"]],
+  beta_plot_list[["0.97"]],
+  beta_plot_list[["0.99"]]
+)
+
+farver <- c(
+  "Rullende vindue"      = "#2196F3",
+  "EWMA (lambda = 0.94)" = "#f85149",
+  "EWMA (lambda = 0.97)" = "#ff9800",
+  "EWMA (lambda = 0.99)" = "#4caf50"
+)
+
+p_fordeling <- ggplot(
+  beta_plot_data %>% filter(beta > -2 & beta < 5),
+  aes(x = beta, fill = metode, color = metode)
+) +
+  geom_density(alpha = 0.2, lwd = 0.8) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50") +
+  scale_fill_manual(values  = farver) +
+  scale_color_manual(values = farver) +
+  labs(
+    x     = "Ex Ante Beta",
+    y     = "Tæthed",
+    fill  = "", color = ""
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p_fordeling)
+
+# Middelvaerdi af beta_L og beta_H per lambda
+# Forudsaetter at koer_ewma_pipeline() og ex_ante_beta_ewma() er defineret
+
+resultater <- data.frame(lambda = numeric(), mean_beta_L = numeric(), mean_beta_H = numeric())
+
+for (lam in c(0.94, 0.97, 0.99)) {
+  
+  daglig_ewma <- daglig %>%
+    group_by(id) %>%
+    mutate(beta_ts = ex_ante_beta_ewma(ret_exc_d, mkt_exc_d, lambda = lam)) %>%
+    ungroup() %>%
+    mutate(beta_exante = ifelse(!is.na(beta_ts), w_fast * beta_ts + (1 - w_fast) * 1, NA_real_))
+  
+  beta_maaned <- daglig_ewma %>%
+    filter(!is.na(beta_exante)) %>%
+    mutate(year_month = format(date, "%Y-%m")) %>%
+    group_by(id, year_month) %>%
+    summarise(beta_sort = last(beta_exante), .groups = "drop") %>%
+    mutate(year_month = format(as.Date(paste0(year_month, "-01")) %m+% months(1), "%Y-%m"))
+  
+  data_p <- aktie_maaned %>%
+    left_join(beta_maaned, by = c("id", "year_month")) %>%
+    filter(!is.na(beta_sort), !is.na(ret_m), !is.na(rf_m), is.finite(beta_sort))
+  
+  bab_stats <- data_p %>%
+    group_by(year_month) %>%
+    summarise(
+      beta_L = {
+        z <- rank(beta_sort); z_bar <- mean(z); k <- 2 / sum(abs(z - z_bar))
+        w_L <- pmax(k * (z_bar - z), 0)
+        sum(w_L * pmax(beta_sort, 0.1))
+      },
+      beta_H = {
+        z <- rank(beta_sort); z_bar <- mean(z); k <- 2 / sum(abs(z - z_bar))
+        w_H <- pmax(k * (z - z_bar), 0)
+        sum(w_H * pmax(beta_sort, 0.1))
+      },
+      .groups = "drop"
+    )
+  
+  resultater <- rbind(resultater, data.frame(
+    lambda     = lam,
+    mean_beta_L = round(mean(bab_stats$beta_L, na.rm = TRUE), 4),
+    mean_beta_H = round(mean(bab_stats$beta_H, na.rm = TRUE), 4)
+  ))
+}
+
+print(resultater)
