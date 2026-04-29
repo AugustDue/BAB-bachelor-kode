@@ -1,0 +1,345 @@
+# =============================================================================
+# SHRINKAGE TEST: Sammenlign BAB-performance med forskellige shrinkage-vægte
+# =============================================================================
+
+# ── STEG 1: Definer vægte ────────────────────────────────────────────────────
+
+shrinkage_weights <- c(0.4, 0.6, 0.9, w_fast)
+shrinkage_labels  <- c("w = 0.4", "w = 0.6", "w = 0.9",
+                       sprintf("w = %.2f", w_fast))
+all_labels <- c(shrinkage_labels, "w varierende")
+
+alle_bab_tidsserier <- list()
+alle_tabeller       <- list()
+alle_bab_stats      <- list()
+
+
+# ── STEG 2: Loop over alle vægte ─────────────────────────────────────────────
+
+for (idx in seq_along(all_labels)) {
+  
+  label <- all_labels[idx]
+  
+  # ── Overskriv beta_exante ──
+  if (label == "w varierende") {
+    daglig <- daglig %>%
+      mutate(beta_exante = ifelse(
+        !is.na(beta_ts) & !is.na(sigma2_xs) & !is.na(sigma2_ts) & (sigma2_xs + sigma2_ts) > 0,
+        (sigma2_xs / (sigma2_xs + sigma2_ts)) * beta_ts +
+          (1 - sigma2_xs / (sigma2_xs + sigma2_ts)) * 1,
+        NA_real_))
+  } else {
+    w <- shrinkage_weights[idx]
+    daglig <- daglig %>%
+      mutate(beta_exante = ifelse(!is.na(beta_ts), w * beta_ts + (1 - w) * 1, NA_real_))
+  }
+  
+  # ── Prop 1 steg 5–8d (overskriver globale variable) ──
+  
+  aktie_måned <- daglig %>%
+    mutate(year_month = format(date, "%Y-%m")) %>%
+    group_by(id, year_month) %>%
+    summarise(
+      ret_exc_m = { v <- !is.na(ret_exc_d); if (sum(v)==0) NA_real_ else prod(1+ret_exc_d[v])-1 },
+      ret_m     = { v <- !is.na(ret_d);     if (sum(v)==0) NA_real_ else prod(1+ret_d[v])-1 },
+      me_m      = { v <- me[!is.na(me)&me>0]; if (length(v)==0) NA_real_ else last(v) },
+      .groups = "drop") %>%
+    left_join(mkt_exc_måned, by = "year_month") %>%
+    left_join(rf_måned, by = "year_month")
+  
+  beta_måned <- daglig %>%
+    filter(!is.na(beta_exante)) %>%
+    mutate(year_month = format(date, "%Y-%m")) %>%
+    group_by(id, year_month) %>%
+    summarise(beta_sort = last(beta_exante), .groups = "drop") %>%
+    mutate(year_month = format(as.Date(paste0(year_month,"-01")) %m+% months(1), "%Y-%m"))
+  
+  data_prop1 <- aktie_måned %>%
+    left_join(beta_måned, by = c("id","year_month")) %>%
+    filter(!is.na(beta_sort), !is.na(ret_exc_m), !is.na(mkt_exc_m), is.finite(beta_sort))
+  
+  data_prop1 <- data_prop1 %>%
+    group_by(year_month) %>% mutate(beta_decil = assign_deciles(beta_sort)) %>% ungroup()
+  
+  port_måned <- data_prop1 %>%
+    group_by(year_month, beta_decil) %>%
+    summarise(port_exc_m = mean(ret_exc_m), mkt_exc_m = first(mkt_exc_m),
+              mean_beta = mean(beta_sort), n_aktier = n(), .groups = "drop")
+  
+  decil_resultater <- port_måned %>%
+    group_by(beta_decil) %>%
+    summarise(
+      alpha = coef(lm(port_exc_m ~ mkt_exc_m))[1],
+      alpha_t = summary(lm(port_exc_m ~ mkt_exc_m))$coefficients[1,3],
+      alpha_p = summary(lm(port_exc_m ~ mkt_exc_m))$coefficients[1,4],
+      real_beta = coef(lm(port_exc_m ~ mkt_exc_m))[2],
+      mean_beta_exante = mean(mean_beta),
+      mean_exc = mean(port_exc_m), sd_exc = sd(port_exc_m),
+      sharpe = mean(port_exc_m)/sd(port_exc_m)*sqrt(12),
+      n_måneder = n(), mean_n_aktier = mean(n_aktier), .groups = "drop")
+  
+  # ── Prop 2 steg 1: BAB ──
+  
+  bab_list <- list()
+  alle_måneder <- sort(unique(data_prop1$year_month))
+  for (i in seq_along(alle_måneder)) {
+    hold_m <- alle_måneder[i]
+    aktier_i <- data_prop1 %>%
+      filter(year_month==hold_m, !is.na(beta_sort), is.finite(beta_sort),
+             !is.na(ret_m), !is.na(rf_m))
+    if (nrow(aktier_i) < 2) next
+    aktier_i <- aktier_i %>% mutate(
+      z=rank(beta_sort), z_bar=mean(z), k=2/sum(abs(z-z_bar)),
+      w_H=pmax(k*(z-z_bar),0), w_L=pmax(k*(z_bar-z),0))
+    r_L <- sum(aktier_i$w_L*aktier_i$ret_m)
+    r_H <- sum(aktier_i$w_H*aktier_i$ret_m)
+    beta_L <- sum(aktier_i$w_L*aktier_i$beta_sort)
+    beta_H <- sum(aktier_i$w_H*aktier_i$beta_sort)
+    if (beta_L<=0 | beta_H<=0) next
+    rf_val <- first(aktier_i$rf_m)
+    bab_exc <- (1/beta_L)*(r_L-rf_val) - (1/beta_H)*(r_H-rf_val)
+    bab_list[[i]] <- data.frame(year_month=hold_m, bab_exc_m=bab_exc,
+                                mkt_exc_m=first(aktier_i$mkt_exc_m),
+                                beta_L=beta_L, beta_H=beta_H)
+  }
+  
+  bab_returns <- bind_rows(bab_list) %>% arrange(year_month) %>% filter(!is.na(bab_exc_m))
+  
+  # ── Prop 2 steg 2: BAB-statistikker ──
+  
+  bab_mod     <- lm(bab_exc_m ~ mkt_exc_m, data = bab_returns)
+  bab_alpha   <- coef(bab_mod)[1]
+  bab_alpha_t <- summary(bab_mod)$coefficients[1,3]
+  bab_sharpe  <- mean(bab_returns$bab_exc_m)/sd(bab_returns$bab_exc_m)*sqrt(12)
+  
+  # ── Gem resultater ──
+  
+  alle_bab_tidsserier[[label]] <- bab_returns %>%
+    arrange(year_month) %>%
+    mutate(kumulativt = cumprod(1 + bab_exc_m), shrinkage = label) %>%
+    select(year_month, kumulativt, shrinkage)
+  
+  alle_bab_stats[[label]] <- data.frame(
+    label = label,
+    mean_exc_pct = mean(bab_returns$bab_exc_m)*100,
+    alpha_pct    = bab_alpha*100,
+    alpha_t      = bab_alpha_t,
+    real_beta    = as.numeric(coef(bab_mod)[2]),
+    beta_spread  = mean(bab_returns$beta_H - bab_returns$beta_L),
+    sharpe       = bab_sharpe
+  )
+    
+    decil_tabel <- decil_resultater %>%
+      mutate(t_excess = mean_exc/(sd_exc/sqrt(n_måneder)),
+             volatility = sd_exc*sqrt(12)*100,
+             mean_exc_pct = mean_exc*100, alpha_pct = alpha*100)
+    
+    bab_stats <- data.frame(
+      mean_exc_pct = mean(bab_returns$bab_exc_m)*100,
+      t_excess = mean(bab_returns$bab_exc_m)/(sd(bab_returns$bab_exc_m)/sqrt(nrow(bab_returns))),
+      alpha_pct = bab_alpha*100, alpha_t = bab_alpha_t,
+      mean_beta_exante = 0.00, real_beta = coef(bab_mod)[2],
+      volatility = sd(bab_returns$bab_exc_m)*sqrt(12)*100, sharpe = bab_sharpe)
+    
+    tabel_df <- data.frame(
+      Metric = c("Merafkast","t-stat","CAPM alpha","t-stat",
+                 "Beta (ex ante)","Beta (realiseret)","Volatilitet","Sharpe ratio"))
+    for (d in 1:10) {
+      row <- decil_tabel %>% filter(beta_decil==d)
+      tabel_df[[paste0("P",d)]] <- c(row$mean_exc_pct, row$t_excess, row$alpha_pct,
+                                     row$alpha_t, row$mean_beta_exante, row$real_beta, row$volatility, row$sharpe)
+    }
+    tabel_df[["BAB"]] <- c(bab_stats$mean_exc_pct, bab_stats$t_excess, bab_stats$alpha_pct,
+                           bab_stats$alpha_t, bab_stats$mean_beta_exante, bab_stats$real_beta,
+                           bab_stats$volatility, bab_stats$sharpe)
+    tabel_df <- tabel_df %>% mutate(across(where(is.numeric), ~round(.,2)))
+    
+    sig_excess <- c(paste0("P",1:10),"BAB")[abs(c(decil_tabel$t_excess, bab_stats$t_excess))>1.96]
+    sig_alpha  <- c(paste0("P",1:10),"BAB")[abs(c(decil_tabel$alpha_t, bab_stats$alpha_t))>1.96]
+    
+    if (label != sprintf("w = %.2f", w_fast)) {
+    
+    tabel_gt <- tabel_df %>%
+      gt(rowname_col = "Metric") %>%
+      cols_label(
+        P1  = html("P1<br>(lav beta)"),
+        P2  = html("P2<br>&nbsp;"),
+        P3  = html("P3<br>&nbsp;"),
+        P4  = html("P4<br>&nbsp;"),
+        P5  = html("P5<br>&nbsp;"),
+        P6  = html("P6<br>&nbsp;"),
+        P7  = html("P7<br>&nbsp;"),
+        P8  = html("P8<br>&nbsp;"),
+        P9  = html("P9<br>&nbsp;"),
+        P10 = html("P10<br>(høj beta)"),
+        BAB = html("BAB<br>&nbsp;")
+      ) %>%
+      cols_align(align = "center", columns = c(P1:P10, BAB)) %>%
+      cols_width(
+        Metric ~ px(110),
+        P1 ~ px(70),
+        P2:P9 ~ px(45),
+        P10 ~ px(70),
+        BAB ~ px(56)
+      ) %>%
+      tab_style(
+        style = cell_text(v_align = "top", weight = "bold"),
+        locations = cells_column_labels()
+      ) %>%
+      tab_style(
+        style = cell_fill(color = "#f5f5f5"),
+        locations = cells_body(rows = Metric == "t-stat")
+      ) %>%
+      fmt_number(columns = everything(), decimals = 2)
+    
+    if (length(sig_excess) > 0) {
+      tabel_gt <- tabel_gt %>%
+        tab_style(
+          style = cell_text(weight = "bold"),
+          locations = cells_body(rows = "Merafkast", columns = sig_excess)
+        )
+    }
+    
+    if (length(sig_alpha) > 0) {
+      tabel_gt <- tabel_gt %>%
+        tab_style(
+          style = cell_text(weight = "bold"),
+          locations = cells_body(rows = "CAPM alpha", columns = sig_alpha)
+        )
+    }
+    
+    tabel_gt <- tabel_gt %>%
+      opt_table_font(font = "Arial") %>%
+      tab_options(
+        table.font.size = 12,
+        column_labels.font.weight = "bold",
+        column_labels.border.top.style = "solid",
+        column_labels.border.top.width = px(1),
+        column_labels.border.bottom.style = "solid",
+        column_labels.border.bottom.width = px(1),
+        table_body.border.bottom.style = "solid",
+        table_body.border.bottom.width = px(1),
+        stub.font.weight = "bold"
+      )
+  
+    alle_tabeller[[label]] <- tabel_gt
+  }
+}
+
+for (label in names(alle_tabeller)) {
+  print(alle_tabeller[[label]])
+}
+
+# ── STEG 3: Kumulativt plot ──────────────────────────────────────────────────
+
+bab_plot_data <- bind_rows(alle_bab_tidsserier) %>%
+  mutate(dato = as.Date(paste0(year_month, "-01")))
+
+p_kum <- ggplot(bab_plot_data, aes(x = dato, y = kumulativt, color = shrinkage)) +
+  geom_line(lwd = 0.7) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray50") +
+  scale_color_manual(values = c(
+    "w = 0.4" = "#ff7f00", "w = 0.6" = "#4daf4a", "w = 0.9" = "#7f00ff",
+    setNames("#377eb8", sprintf("w = %.2f", w_fast)),
+    "w varierende" = "#a65628")) +
+  labs(x = "År", y = "Kumulativt merafkast (indekseret til 1)", color = "Shrinkage") +
+  theme_minimal() + theme(legend.position = "bottom")
+print(p_kum)
+
+# ── STEG 4: BAB-sammenligningstabel ─────────────────────────────────────────
+
+# Saml BAB-statistikker fra alle vægte
+bab_sammenligning <- list()
+
+for (label in all_labels) {
+  res <- alle_bab_stats[[label]]
+  
+  # Hent ekstra stats fra den gemte pipeline
+  # Vi skal bruge volatilitet, real_beta og beta_exante som ikke er i alle_bab_stats
+  # Genberegn fra tidsserien
+  ts <- alle_bab_tidsserier[[label]] %>%
+    arrange(year_month) %>%
+    mutate(bab_exc_m = kumulativt / lag(kumulativt) - 1) %>%
+    filter(!is.na(bab_exc_m))
+  
+  bab_sammenligning[[label]] <- data.frame(
+    Shrinkage    = label,
+    Merafkast    = res$mean_exc_pct,
+    t_stat_exc   = res$mean_exc_pct / 100 / (sd(ts$bab_exc_m) / sqrt(nrow(ts))),
+    CAPM_alpha   = res$alpha_pct,
+    t_stat_alpha = res$alpha_t,
+    Beta_exante  = 0.00,
+    real_beta    = res$real_beta,
+    Beta_spread  = res$beta_spread,
+    Volatilitet  = sd(ts$bab_exc_m) * sqrt(12) * 100,
+    Sharpe       = res$sharpe
+  )
+}
+
+bab_df <- bind_rows(bab_sammenligning)
+
+# Byg gt-tabel
+bab_gt_df <- data.frame(
+  Metric = c("Merafkast", "t-stat", "CAPM alpha", "t-stat",
+             "Beta (ex ante)", "Beta (realiseret)", "Beta-spread", "Volatilitet", "Sharpe ratio")
+)
+
+for (r in 1:nrow(bab_df)) {
+  bab_gt_df[[bab_df$Shrinkage[r]]] <- c(
+    round(bab_df$Merafkast[r], 2),
+    round(bab_df$t_stat_exc[r], 2),
+    round(bab_df$CAPM_alpha[r], 2),
+    round(bab_df$t_stat_alpha[r], 2),
+    round(bab_df$Beta_exante[r], 2),
+    round(as.numeric(bab_df$real_beta[r]), 2),
+    round(bab_df$Beta_spread[r], 2),
+    round(bab_df$Volatilitet[r], 2),
+    round(bab_df$Sharpe[r], 2)
+  )
+}
+
+# Signifikans per vægt
+sig_exc_cols <- bab_df$Shrinkage[abs(bab_df$t_stat_exc) > 1.96]
+sig_alp_cols <- bab_df$Shrinkage[abs(bab_df$t_stat_alpha) > 1.96]
+
+bab_gt <- bab_gt_df %>%
+  gt(rowname_col = "Metric") %>%
+  cols_align(align = "center", columns = everything()) %>%
+  tab_style(
+    style = cell_fill(color = "#f5f5f5"),
+    locations = cells_body(rows = Metric == "t-stat")
+  ) %>%
+  fmt_number(columns = everything(), decimals = 2) %>%
+  tab_style(
+    style = cell_text(v_align = "top", weight = "bold"),
+    locations = cells_column_labels()
+  )
+
+if (length(sig_exc_cols) > 0) {
+  bab_gt <- bab_gt %>%
+    tab_style(style = cell_text(weight = "bold"),
+              locations = cells_body(rows = "Merafkast", columns = sig_exc_cols))
+}
+if (length(sig_alp_cols) > 0) {
+  bab_gt <- bab_gt %>%
+    tab_style(style = cell_text(weight = "bold"),
+              locations = cells_body(rows = "CAPM alpha", columns = sig_alp_cols))
+}
+
+bab_gt <- bab_gt %>%
+  opt_table_font(font = "Arial") %>%
+  tab_options(
+    table.font.size = 12,
+    column_labels.font.weight = "bold",
+    column_labels.border.top.style = "solid",
+    column_labels.border.top.width = px(1),
+    column_labels.border.bottom.style = "solid",
+    column_labels.border.bottom.width = px(1),
+    table_body.border.bottom.style = "solid",
+    table_body.border.bottom.width = px(1),
+    stub.font.weight = "bold"
+  )
+
+print(bab_gt)
+
+print(bind_rows(alle_bab_stats))
