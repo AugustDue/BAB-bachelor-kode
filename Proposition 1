@@ -1,0 +1,376 @@
+# =============================================================================
+# PROPOSITION 1: BAB — Alpha falder med beta (Frazzini & Pedersen 2014)
+#
+# NAVNGIVNINGSKONVENTION:
+#   _ret     = råt afkast (total return)
+#   _exc     = merafkast (excess return = afkast minus risikofri rente)
+#   _d       = daglig
+#   _m       = månedlig
+#   mkt_     = markedsporteføljen (value-weighted)
+#   port_    = decilportefølje (equal-weighted)
+#   mkt_ret_d   = dagligt råt markedsafkast
+#   mkt_exc_d   = dagligt markedsmerafkast (market_ret - rf)
+#   mkt_exc_m   = månedligt markedsmerafkast (compoundet fra daglige)
+#   port_exc_m  = månedligt porteføljemerafkast (EW gennemsnit af aktiers exc)
+#   ret_exc_d   = dagligt aktiemerafkast (fra datasættet)
+#   ret_exc_m   = månedligt aktiemerafkast (kompounderet fra daglige)
+# =============================================================================
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(gt)
+library(zoo)
+library(lubridate)
+
+# ── STEP 1: Klargør dagligt data ─────────────────────────────────────────────
+
+daglig <- data_daglig %>%
+  mutate(
+    ret_d     = as.numeric(ret),       # dagligt råt afkast
+    ret_exc_d = as.numeric(ret_exc),   # dagligt merafkast (fra datasæt)
+    me        = as.numeric(me)         # markedsværdi
+  ) %>%
+  arrange(id, date)
+
+# Fælles daglig risikofri rente (gennemsnit over alle aktier)
+rf_daglig <- daglig %>%
+  filter(!is.na(ret_d), !is.na(ret_exc_d)) %>%
+  group_by(date) %>%
+  summarise(rf_d = mean(ret_d - ret_exc_d, na.rm = TRUE), .groups = "drop")
+
+# Dagligt råt markedsafkast (value-weighted)
+marked_daglig <- daglig %>%
+  group_by(date) %>%
+  summarise(
+    mkt_ret_d = {
+      valid <- !is.na(ret_d) & !is.na(me) & me > 0
+      if (sum(valid) == 0) NA_real_
+      else weighted.mean(ret_d[valid], me[valid])
+    },
+    .groups = "drop"
+  ) %>%
+  left_join(rf_daglig, by = "date") %>%
+  mutate(mkt_exc_d = mkt_ret_d - rf_d)   # dagligt markedsmerafkast
+
+# Join til aktiedata
+daglig <- daglig %>%
+  left_join(rf_daglig, by = "date") %>%
+  left_join(marked_daglig %>% select(date, mkt_ret_d, mkt_exc_d), by = "date")
+
+
+# ── STEP 2: Funktion til Ex Ante Beta ────────────────────────────────────────
+
+ex_ante_beta <- function(ret_exc_d, mkt_exc_d,
+                         vol_window  = 252,
+                         vol_min     = 120,
+                         corr_window = 5 * 252,
+                         corr_min    = 750) {
+  
+  n <- length(ret_exc_d)
+  betas <- rep(NA_real_, n)
+  if (n <= corr_window) return(betas)
+  
+  # Konverter merafkast til log-merafkast
+  log_exc_i <- log(1 + ret_exc_d)
+  log_exc_m <- log(1 + mkt_exc_d)
+  
+  # Overlappende 3-dags log-merafkast (til korrelation)
+  log3_exc_i <- rep(NA_real_, n)
+  log3_exc_m <- rep(NA_real_, n)
+  for (j in 1:(n - 2)) {
+    if (!is.na(log_exc_i[j]) && !is.na(log_exc_i[j+1]) && !is.na(log_exc_i[j+2])) {
+      log3_exc_i[j] <- log_exc_i[j] + log_exc_i[j+1] + log_exc_i[j+2]
+    }
+    if (!is.na(log_exc_m[j]) && !is.na(log_exc_m[j+1]) && !is.na(log_exc_m[j+2])) {
+      log3_exc_m[j] <- log_exc_m[j] + log_exc_m[j+1] + log_exc_m[j+2]
+    }
+  }
+  
+  for (i in (corr_window + 1):n) {
+    # Volatilitet: uafhængige masks for aktie og marked
+    vol_idx <- max(1, i - vol_window):(i - 1)
+    mask_i <- !is.na(log_exc_i[vol_idx])
+    mask_m <- !is.na(log_exc_m[vol_idx])
+    if (sum(mask_i) < vol_min || sum(mask_m) < vol_min) next
+    
+    sigma_i <- sd(log_exc_i[vol_idx][mask_i])
+    sigma_m <- sd(log_exc_m[vol_idx][mask_m])
+    if (is.na(sigma_m) || sigma_m == 0) next
+    
+    # Korrelation: 5-års vindue af 3-dags log-merafkast
+    corr_idx  <- max(1, i - corr_window):(i - 1)
+    y         <- log3_exc_i[corr_idx]
+    x         <- log3_exc_m[corr_idx]
+    corr_mask <- !is.na(y) & !is.na(x)
+    if (sum(corr_mask) < corr_min) next
+    
+    rho_hat  <- cor(y[corr_mask], x[corr_mask])
+    betas[i] <- rho_hat * (sigma_i / sigma_m)
+  }
+  return(betas)
+}
+
+# ── STEP 3: Beregn beta_TS per aktie ─────────────────────────────────────────
+
+cat("Beregner Ex Ante Beta (kan tage nogle minutter) ...\n")
+
+daglig <- daglig %>%
+  group_by(id) %>%
+  mutate(beta_ts = ex_ante_beta(ret_exc_d, mkt_exc_d)) %>%
+  ungroup()
+
+# ── STEP 4: Shrinkage (Vasicek 1973) ──────────────────
+# ── 4a) Beregn sigma2_TS per aktie: standardfejl^2 af beta-estimatet ────────
+
+daglig <- daglig %>%
+  arrange(id, date) %>%
+  group_by(id) %>%
+  mutate(sigma2_ts = rollapply(
+    data.frame(y = ret_exc_d, x = mkt_exc_d, b = beta_ts),
+    width = 252,
+    FUN = function(df) {
+      y <- df[, 1]
+      x <- df[, 2]
+      b_i <- df[, 3]
+      ok <- !is.na(y) & !is.na(x) & !is.na(b_i)
+      if (sum(ok) < 120) return(NA_real_)
+      y <- y[ok]
+      x <- x[ok]
+      b_i <- b_i[ok]
+      T_i <- length(y)
+      x_bar <- mean(x)
+      v <- sum((x - x_bar)^2)
+      if (v == 0) return(NA_real_)
+      # Brug den sidste beta_ts i vinduet
+      beta_hat <- tail(b_i, 1)
+      # Alpha fra beta_ts: alpha = mean(y) - beta_ts * mean(x)
+      alpha_hat <- mean(y) - beta_hat * x_bar
+      # Residualer fra beta
+      eps <- y - alpha_hat - beta_hat * x
+      # Vasicek: s^2 = sum(eps^2)/(T-2), s_b^2 = s^2/v
+      s2 <- sum(eps^2) / (T_i - 2)
+      s2 / v
+    },
+    by.column = FALSE,
+    fill = NA,
+    align = "right"
+  )) %>%
+  ungroup()
+
+# ── 4b) Beregn sigma2_XS per dato: renset tværsnitsvarians ──────────────────
+
+daglig <- daglig %>%
+  group_by(date) %>%
+  mutate(
+    sigma2_xs = {
+      valid <- !is.na(beta_ts) & !is.na(sigma2_ts)
+      if (sum(valid) < 2) NA_real_
+      else {
+        var_obs  <- var(beta_ts[valid])                    # observeret tværsnitsvarians
+        mean_s2  <- mean(sigma2_ts[valid])                 # gns. estimeringsvarians
+        max(var_obs - mean_s2, 1e-8)                       # renset, med gulv > 0
+      }
+    }
+  ) %>%
+  ungroup()
+
+# ── 4c) Fast shrinkage-vægt (gennemsnit af Vasicek w_i) ─────────────────────
+
+w_fast <- daglig %>%
+  filter(!is.na(sigma2_ts), !is.na(sigma2_xs), (sigma2_xs + sigma2_ts) > 0) %>%
+  mutate(w_i = sigma2_xs / (sigma2_xs + sigma2_ts)) %>%
+  summarise(mean(w_i, na.rm = TRUE)) %>%
+  pull()
+
+cat(sprintf("Fast shrinkage-vægt: %.4f\n", w_fast))
+
+# ── 4d) Anvend shrinkage: beta_exante = w * beta_ts + (1-w) * 1 ─────────────
+daglig <- daglig %>%
+  mutate(beta_exante = ifelse(!is.na(beta_ts),
+  w_fast * beta_ts + (1 - w_fast) * 1, NA_real_))
+
+# ── STEP 5: Byg månedlige afkast fra dagligt data ───────────────────────────
+
+# 5a) Fælles månedligt markedsmerafkast
+mkt_exc_måned <- marked_daglig %>%
+  filter(!is.na(mkt_exc_d)) %>%
+  mutate(year_month = format(date, "%Y-%m")) %>%
+  group_by(year_month) %>%
+  summarise(mkt_exc_m = prod(1 + mkt_exc_d) - 1, .groups = "drop")
+
+# 5b) Fælles månedlig risikofri rente
+rf_måned <- rf_daglig %>%
+  filter(!is.na(rf_d)) %>%
+  mutate(year_month = format(date, "%Y-%m")) %>%
+  group_by(year_month) %>%
+  summarise(rf_m = prod(1 + rf_d) - 1, .groups = "drop")
+
+# 5c) Aktiens månedlige afkast (råt + merafkast) + markedsværdi
+aktie_måned <- daglig %>%
+  mutate(year_month = format(date, "%Y-%m")) %>%
+  group_by(id, year_month) %>%
+  summarise(
+    ret_exc_m = {
+      valid <- !is.na(ret_exc_d)
+      if (sum(valid) == 0) NA_real_
+      else prod(1 + ret_exc_d[valid]) - 1
+    },
+    ret_m = {
+      valid <- !is.na(ret_d)
+      if (sum(valid) == 0) NA_real_
+      else prod(1 + ret_d[valid]) - 1
+    },
+    me_m = {
+      valid_me <- me[!is.na(me) & me > 0]
+      if (length(valid_me) == 0) NA_real_
+      else last(valid_me)
+    },
+    .groups = "drop"
+  ) %>%
+  left_join(mkt_exc_måned, by = "year_month") %>%
+  left_join(rf_måned, by = "year_month")        
+
+
+# ── STEP 6: Aggreger Ex Ante Beta til månedsniveau (med 1-måneds lag) ────────
+
+beta_måned <- daglig %>%
+  filter(!is.na(beta_exante)) %>%
+  mutate(year_month = format(date, "%Y-%m")) %>%
+  group_by(id, year_month) %>%
+  summarise(beta_sort = last(beta_exante), .groups = "drop") %>%
+  mutate(year_month = format(
+    as.Date(paste0(year_month, "-01")) %m+% months(1), "%Y-%m"
+  ))
+
+# ── STEP 7: Merge og filtrer ─────────────────────────────────────────────────
+data_prop1 <- aktie_måned %>%
+  left_join(beta_måned, by = c("id", "year_month")) %>%
+  filter(!is.na(beta_sort), !is.na(ret_exc_m), !is.na(mkt_exc_m),
+         is.finite(beta_sort))
+
+# ── STEP 8: Månedlig decil-tilordning og porteføljeafkast ───────────────────
+
+# 8a) HJÆLPEFUNKTION: Deciltilordning med yderdecilprioritet ───────────────────
+assign_deciles <- function(beta, n_groups = 10) {
+  n <- length(beta)
+  base_size <- n %/% n_groups
+  remainder <- n %% n_groups
+  
+  # Prioritetsrækkefølge: yderdeciler først
+  priority <- c(1, n_groups)
+  inner <- 2:(n_groups - 1)
+  priority <- c(priority, inner[order(pmin(inner - 1, n_groups - inner))])
+  
+  sizes <- rep(base_size, n_groups)
+  if (remainder > 0) {
+    sizes[priority[1:remainder]] <- sizes[priority[1:remainder]] + 1
+  }
+  
+  ranks <- rank(beta, ties.method = "first")
+  breaks <- cumsum(c(0, sizes))
+  decil <- rep(NA_integer_, n)
+  for (g in 1:n_groups) {
+    decil[ranks > breaks[g] & ranks <= breaks[g + 1]] <- g
+  }
+  return(decil)
+}
+
+# 8b) Tildel deciler HVER MÅNED med yderdecilprioritet
+data_prop1 <- data_prop1 %>%
+  group_by(year_month) %>%
+  mutate(beta_decil = assign_deciles(beta_sort)) %>%
+  ungroup()
+
+# 8c) Equal-weighted porteføljemerafkast per decil per måned
+port_måned <- data_prop1 %>%
+  group_by(year_month, beta_decil) %>%
+  summarise(
+    port_exc_m  = mean(ret_exc_m),      # EW portefølje-MERAFKAST
+    mkt_exc_m   = first(mkt_exc_m),     # fælles markeds-MERAFKAST
+    mean_beta   = mean(beta_sort),      # EW gennemsnits-beta
+    n_aktier    = n(),
+    .groups     = "drop"
+  )
+
+# 8d) Tidsserieregression per decil:
+#       port_exc_m = alpha + beta * mkt_exc_m + epsilon
+
+decil_resultater <- port_måned %>%
+  group_by(beta_decil) %>%
+  summarise(
+    alpha      = coef(lm(port_exc_m ~ mkt_exc_m))[1],
+    alpha_t    = summary(lm(port_exc_m ~ mkt_exc_m))$coefficients[1, 3],
+    alpha_p    = summary(lm(port_exc_m ~ mkt_exc_m))$coefficients[1, 4],
+    real_beta  = coef(lm(port_exc_m ~ mkt_exc_m))[2],
+    mean_beta_exante = mean(mean_beta),
+    mean_exc   = mean(port_exc_m),
+    sd_exc     = sd(port_exc_m),
+    sharpe     = mean(port_exc_m) / sd(port_exc_m) * sqrt(12),
+    n_måneder    = n(),
+    mean_n_aktier = mean(n_aktier),
+    .groups       = "drop"
+  )
+
+# ── STEP 9: Test af sharpe ratio ──────────────────────────────────────────────
+
+# (iii) Sharpe falder med beta
+mod_iii <- lm(sharpe ~ mean_beta_exante, data = decil_resultater)
+print(summary(mod_iii))
+if (coef(mod_iii)["mean_beta_exante"] < 0) {
+  cat("BEKRÆFTET: Sharpe falder med beta.\n")
+} else {
+  cat("AFVIST.\n")
+}
+
+# ── STEP 10: Plots ───────────────────────────────────────────────────────────
+
+lambda <- mean(port_måned$mkt_exc_m, na.rm = TRUE)
+
+# --- Plot: Security Market Line — ALLE AKTIER ---
+# Beregn gennemsnitligt afkast og beta per aktie på tværs af hele perioden
+aktie_summary <- data_prop1 %>%
+  group_by(id) %>%
+  filter(n() >= 24) %>%
+  summarise(
+    mean_ret        = mean(ret_exc_m, na.rm = TRUE),
+    mean_beta_exante = mean(beta_sort,    na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(is.finite(mean_ret) & is.finite(mean_beta_exante))
+
+mod_ii        <- lm(mean_ret ~ mean_beta_exante, data = aktie_summary)
+sml_hældning <- coef(mod_ii)["mean_beta_exante"]
+
+cat(sprintf("Antal aktier i SML-regression: %d\n", nrow(aktie_summary)))
+
+p1 <- ggplot(aktie_summary, aes(x = mean_beta_exante, y = mean_ret)) +
+  geom_point(alpha = 0.15, size = 0.6, color = "gray40") +
+  geom_smooth(method = "lm", se = TRUE, color = "blue", lwd = 1) +
+  geom_abline(intercept = 0, slope = lambda,
+              color = "red", lwd = 1, linetype = "dashed") +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray70") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
+  coord_cartesian(
+    xlim = c(0, quantile(aktie_summary$mean_beta_exante, 0.99, na.rm = TRUE)),
+    ylim = c(quantile(aktie_summary$mean_ret, 0.01, na.rm = TRUE),
+             quantile(aktie_summary$mean_ret, 0.99, na.rm = TRUE))
+  ) +
+  annotate("text",
+           x     = quantile(aktie_summary$mean_beta_exante, 0.85, na.rm = TRUE),
+           y     = lambda * quantile(aktie_summary$mean_beta_exante, 0.85, na.rm = TRUE) * 1.4,
+           label = "Teoretisk SML",
+           color = "red", size = 3.5) +
+  annotate("text",
+           x     = quantile(aktie_summary$mean_beta_exante, 0.85, na.rm = TRUE),
+           y     = sml_hældning * quantile(aktie_summary$mean_beta_exante, 0.85, na.rm = TRUE) * 0.6,
+           label = "Empirisk SML",
+           color = "blue", size = 3.5) +
+  labs(
+    title    = "",
+    subtitle = "",
+    x = "Gns. Beta Ex Ante",
+    y = "Gns. månedligt merafkast"
+  ) +
+  theme_minimal()
+print(p1)
