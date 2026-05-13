@@ -1,5 +1,10 @@
+#Bemræk at denne kode udskriver to tabeller svarende til Tabel 5 og 6 i projektet!
+
 # =============================================================================
-# PROPOSITION 1: BAB — Alpha falder med beta (Frazzini & Pedersen 2014)
+# VINDUESTEST: Sammenlign BAB med forskellige volatilitets- og korrelationsvinduer
+#
+# Specifikation A: vol = 252 dage (1 år), korr = 252 dage (1 år)
+# Specifikation B: vol = 126 dage (½ år), korr = 504 dage (2 år)
 # =============================================================================
 
 library(dplyr)
@@ -9,369 +14,228 @@ library(gt)
 library(zoo)
 library(lubridate)
 
-# ── STEP 1: Klargør dagligt data ─────────────────────────────────────────────
+# ── FÆLLES: Klargør data (køres kun én gang) ─────────────────────────────────
 
-daglig  <- data_daglig %>%
-  mutate(
-    ret_d     = as.numeric(ret),
-    ret_exc_d = as.numeric(ret_exc),
-    me        = as.numeric(me)
-  ) %>%
+daglig <- data_daglig %>%
+  mutate(ret_d = as.numeric(ret), ret_exc_d = as.numeric(ret_exc),
+         me = as.numeric(me)) %>%
   arrange(id, date)
 
-# Fælles daglig risikofri rente
 rf_daglig <- daglig %>%
   filter(!is.na(ret_d), !is.na(ret_exc_d)) %>%
   group_by(date) %>%
   summarise(rf_d = mean(ret_d - ret_exc_d, na.rm = TRUE), .groups = "drop")
 
-# Dagligt råt markedsafkast (value-weighted)
 marked_daglig <- daglig %>%
   group_by(date) %>%
-  summarise(
-    mkt_ret_d = {
-      valid <- !is.na(ret_d) & !is.na(me) & me > 0
-      if (sum(valid) == 0) NA_real_
-      else weighted.mean(ret_d[valid], me[valid])
-    },
-    .groups = "drop"
-  ) %>%
-  left_join(rf_daglig , by = "date") %>%
+  summarise(mkt_ret_d = {
+    valid <- !is.na(ret_d) & !is.na(me) & me > 0
+    if (sum(valid) == 0) NA_real_ else weighted.mean(ret_d[valid], me[valid])
+  }, .groups = "drop") %>%
+  left_join(rf_daglig, by = "date") %>%
   mutate(mkt_exc_d = mkt_ret_d - rf_d)
 
-# Join til aktiedata
-daglig <- daglig  %>%
+daglig <- daglig %>%
   left_join(rf_daglig, by = "date") %>%
-  left_join(marked_daglig  %>% select(date, mkt_ret_d, mkt_exc_d), by = "date")
+  left_join(marked_daglig %>% select(date, mkt_ret_d, mkt_exc_d), by = "date")
 
-
-# ── STEP 2: Funktion til Ex Ante Beta ────────────────────────────────────────
-
-ex_ante_beta <- function(ret_exc_d, mkt_exc_d,
-                         vol_window  = 126,
-                         vol_min     = 60,
-                         corr_window = 504,
-                         corr_min    = 315) {
-  n <- length(ret_exc_d)
-  betas <- rep(NA_real_, n)
-  if (n <= corr_window) return(betas)
-  
-  log_exc_i <- log(1 + ret_exc_d)
-  log_exc_m <- log(1 + mkt_exc_d)
-  
-  log3_exc_i <- rep(NA_real_, n)
-  log3_exc_m <- rep(NA_real_, n)
-  for (j in 1:(n - 2)) {
-    if (!is.na(log_exc_i[j]) && !is.na(log_exc_i[j+1]) && !is.na(log_exc_i[j+2]))
-      log3_exc_i[j] <- log_exc_i[j] + log_exc_i[j+1] + log_exc_i[j+2]
-    if (!is.na(log_exc_m[j]) && !is.na(log_exc_m[j+1]) && !is.na(log_exc_m[j+2]))
-      log3_exc_m[j] <- log_exc_m[j] + log_exc_m[j+1] + log_exc_m[j+2]
-  }
-  
-  for (i in (corr_window + 1):n) {
-    vol_idx <- max(1, i - vol_window):(i - 1)
-    mask_i  <- !is.na(log_exc_i[vol_idx])
-    mask_m  <- !is.na(log_exc_m[vol_idx])
-    if (sum(mask_i) < vol_min || sum(mask_m) < vol_min) next
-    sigma_i <- sd(log_exc_i[vol_idx][mask_i])
-    sigma_m <- sd(log_exc_m[vol_idx][mask_m])
-    if (is.na(sigma_m) || sigma_m == 0) next
-    corr_idx  <- max(1, i - corr_window):(i - 1)
-    y         <- log3_exc_i[corr_idx]
-    x         <- log3_exc_m[corr_idx]
-    corr_mask <- !is.na(y) & !is.na(x)
-    if (sum(corr_mask) < corr_min) next
-    rho_hat  <- cor(y[corr_mask], x[corr_mask])
-    betas[i] <- rho_hat * (sigma_i / sigma_m)
-  }
-  return(betas)
-}
-
-# ── STEP 3: Beregn beta_TS per aktie ─────────────────────────────────────────
-
-cat("Beregner Ex Ante Beta (kan tage nogle minutter) ...\n")
-
-daglig  <- daglig  %>%
-  group_by(id) %>%
-  mutate(beta_ts = ex_ante_beta(ret_exc_d, mkt_exc_d)) %>%
-  ungroup()
-
-# ── STEP 4: Shrinkage ────────────────────────────────────────────────────────
-w_fast <- 0.7561779
-
-daglig  <- daglig  %>%
-  mutate(beta_exante = ifelse(!is.na(beta_ts),
-                              w_fast * beta_ts + (1 - w_fast) * 1, NA_real_))
-
-
-# ── STEP 5: Byg månedlige afkast ─────────────────────────────────────────────
-
-mkt_exc_måned  <- marked_daglig  %>%
+mkt_exc_måned <- marked_daglig %>%
   filter(!is.na(mkt_exc_d)) %>%
   mutate(year_month = format(date, "%Y-%m")) %>%
   group_by(year_month) %>%
   summarise(mkt_exc_m = prod(1 + mkt_exc_d) - 1, .groups = "drop")
 
-rf_måned  <- rf_daglig  %>%
+rf_måned <- rf_daglig %>%
   filter(!is.na(rf_d)) %>%
   mutate(year_month = format(date, "%Y-%m")) %>%
   group_by(year_month) %>%
   summarise(rf_m = prod(1 + rf_d) - 1, .groups = "drop")
 
-aktie_måned  <- daglig  %>%
+aktie_måned <- daglig %>%
   mutate(year_month = format(date, "%Y-%m")) %>%
   group_by(id, year_month) %>%
   summarise(
-    ret_exc_m = {
-      valid <- !is.na(ret_exc_d)
-      if (sum(valid) == 0) NA_real_
-      else prod(1 + ret_exc_d[valid]) - 1
-    },
-    ret_m = {
-      valid <- !is.na(ret_d)
-      if (sum(valid) == 0) NA_real_
-      else prod(1 + ret_d[valid]) - 1
-    },
-    me_m = {
-      valid_me <- me[!is.na(me) & me > 0]
-      if (length(valid_me) == 0) NA_real_
-      else last(valid_me)
-    },
-    .groups = "drop"
-  ) %>%
-  left_join(mkt_exc_måned , by = "year_month") %>%
-  left_join(rf_måned , by = "year_month")
-
-
-# ── STEP 6: Aggreger Ex Ante Beta til månedsniveau (med 1-måneds lag) ────────
-
-beta_måned  <- daglig  %>%
-  filter(!is.na(beta_exante)) %>%
-  mutate(year_month = format(date, "%Y-%m")) %>%
-  group_by(id, year_month) %>%
-  summarise(beta_sort = last(beta_exante), .groups = "drop") %>%
-  mutate(year_month = format(
-    as.Date(paste0(year_month, "-01")) %m+% months(1), "%Y-%m"
-  ))
-
-# ── STEP 7: Merge og filtrer ──────────────────────────────────────────────────
-
-data_prop1  <- aktie_måned  %>%
-  left_join(beta_måned , by = c("id", "year_month")) %>%
-  filter(!is.na(beta_sort), !is.na(ret_exc_m), !is.na(mkt_exc_m),
-         is.finite(beta_sort))
-
-# ── STEP 8: Deciltilordning og porteføljeafkast ───────────────────────────────
+    ret_exc_m = { v <- !is.na(ret_exc_d); if (sum(v)==0) NA_real_ else prod(1+ret_exc_d[v])-1 },
+    ret_m     = { v <- !is.na(ret_d);     if (sum(v)==0) NA_real_ else prod(1+ret_d[v])-1 },
+    me_m      = { v <- me[!is.na(me)&me>0]; if(length(v)==0) NA_real_ else last(v) },
+    .groups = "drop") %>%
+  left_join(mkt_exc_måned, by = "year_month") %>%
+  left_join(rf_måned, by = "year_month")
 
 assign_deciles <- function(beta, n_groups = 10) {
-  n <- length(beta)
-  base_size <- n %/% n_groups
-  remainder <- n %% n_groups
+  n <- length(beta); base_size <- n %/% n_groups; remainder <- n %% n_groups
   priority <- c(1, n_groups)
   inner <- 2:(n_groups - 1)
   priority <- c(priority, inner[order(pmin(inner - 1, n_groups - inner))])
   sizes <- rep(base_size, n_groups)
-  if (remainder > 0)
-    sizes[priority[1:remainder]] <- sizes[priority[1:remainder]] + 1
-  ranks  <- rank(beta, ties.method = "first")
-  breaks <- cumsum(c(0, sizes))
-  decil  <- rep(NA_integer_, n)
-  for (g in 1:n_groups)
-    decil[ranks > breaks[g] & ranks <= breaks[g + 1]] <- g
+  if (remainder > 0) sizes[priority[1:remainder]] <- sizes[priority[1:remainder]] + 1
+  ranks <- rank(beta, ties.method = "first"); breaks <- cumsum(c(0, sizes))
+  decil <- rep(NA_integer_, n)
+  for (g in 1:n_groups) decil[ranks > breaks[g] & ranks <= breaks[g+1]] <- g
   return(decil)
 }
 
-data_prop1  <- data_prop1  %>%
-  group_by(year_month) %>%
-  mutate(beta_decil = assign_deciles(beta_sort)) %>%
-  ungroup()
+w_fast <- 0.7561779
 
-port_måned  <- data_prop1  %>%
-  group_by(year_month, beta_decil) %>%
-  summarise(
-    port_exc_m = mean(ret_exc_m),
-    mkt_exc_m  = first(mkt_exc_m),
-    mean_beta  = mean(beta_sort),
-    n_aktier   = n(),
-    .groups    = "drop"
-  )
 
-decil_resultater  <- port_måned  %>%
-  group_by(beta_decil) %>%
-  summarise(
-    alpha            = coef(lm(port_exc_m ~ mkt_exc_m))[1],
-    alpha_t          = summary(lm(port_exc_m ~ mkt_exc_m))$coefficients[1, 3],
-    alpha_p          = summary(lm(port_exc_m ~ mkt_exc_m))$coefficients[1, 4],
-    real_beta        = coef(lm(port_exc_m ~ mkt_exc_m))[2],
-    mean_beta_exante = mean(mean_beta),
-    mean_exc         = mean(port_exc_m),
-    sd_exc           = sd(port_exc_m),
-    sharpe           = mean(port_exc_m) / sd(port_exc_m) * sqrt(12),
-    n_måneder        = n(),
-    mean_n_aktier    = mean(n_aktier),
-    .groups          = "drop"
-  )
+# ── FUNKTION: Ex Ante Beta ───────────────────────────────────────────────────
 
-# =========================
-# PROPOSITION 2: BAB
-# =========================
-
-bab_list      <- list()
-alle_måneder  <- sort(unique(data_prop1 $year_month))
-
-for (i in seq_along(alle_måneder )) {
-  hold_m   <- alle_måneder [i]
-  aktier_i <- data_prop1  %>%
-    filter(year_month == hold_m,
-           !is.na(beta_sort), is.finite(beta_sort),
-           !is.na(ret_m), !is.na(rf_m))
-  if (nrow(aktier_i) < 2) next
-  
-  aktier_i <- aktier_i %>%
-    mutate(
-      z     = rank(beta_sort),
-      z_bar = mean(z),
-      k     = 2 / sum(abs(z - z_bar)),
-      w_H   = pmax(k * (z - z_bar), 0),
-      w_L   = pmax(k * (z_bar - z), 0)
-    )
-  
-  r_L    <- sum(aktier_i$w_L * aktier_i$ret_m)
-  r_H    <- sum(aktier_i$w_H * aktier_i$ret_m)
-  beta_L <- sum(aktier_i$w_L * aktier_i$beta_sort)
-  beta_H <- sum(aktier_i$w_H * aktier_i$beta_sort)
-  if (beta_L <= 0 | beta_H <= 0) next
-  
-  rf_m_i    <- first(aktier_i$rf_m)
-  bab_exc_m <- (1 / beta_L) * (r_L - rf_m_i) - (1 / beta_H) * (r_H - rf_m_i)
-  
-  bab_list[[i]] <- data.frame(
-    year_month = hold_m,
-    bab_exc_m  = bab_exc_m,
-    mkt_exc_m  = first(aktier_i$mkt_exc_m),
-    rf_m       = rf_m_i,
-    r_L = r_L, r_H = r_H, beta_L = beta_L, beta_H = beta_H
-  )
+ex_ante_beta <- function(ret_exc_d, mkt_exc_d,
+                         vol_window, vol_min, corr_window, corr_min) {
+  n <- length(ret_exc_d); betas <- rep(NA_real_, n)
+  if (n <= corr_window) return(betas)
+  log_exc_i <- log(1 + ret_exc_d); log_exc_m <- log(1 + mkt_exc_d)
+  log3_exc_i <- rep(NA_real_, n); log3_exc_m <- rep(NA_real_, n)
+  for (j in 1:(n-2)) {
+    if (!is.na(log_exc_i[j])&&!is.na(log_exc_i[j+1])&&!is.na(log_exc_i[j+2]))
+      log3_exc_i[j] <- log_exc_i[j]+log_exc_i[j+1]+log_exc_i[j+2]
+    if (!is.na(log_exc_m[j])&&!is.na(log_exc_m[j+1])&&!is.na(log_exc_m[j+2]))
+      log3_exc_m[j] <- log_exc_m[j]+log_exc_m[j+1]+log_exc_m[j+2]
+  }
+  for (i in (corr_window+1):n) {
+    vol_idx <- max(1, i-vol_window):(i-1)
+    mask_i <- !is.na(log_exc_i[vol_idx]); mask_m <- !is.na(log_exc_m[vol_idx])
+    if (sum(mask_i)<vol_min||sum(mask_m)<vol_min) next
+    sigma_i <- sd(log_exc_i[vol_idx][mask_i]); sigma_m <- sd(log_exc_m[vol_idx][mask_m])
+    if (is.na(sigma_m)||sigma_m==0) next
+    corr_idx <- max(1, i-corr_window):(i-1)
+    y <- log3_exc_i[corr_idx]; x <- log3_exc_m[corr_idx]
+    corr_mask <- !is.na(y)&!is.na(x)
+    if (sum(corr_mask)<corr_min) next
+    rho_hat <- cor(y[corr_mask], x[corr_mask])
+    betas[i] <- rho_hat*(sigma_i/sigma_m)
+  }
+  return(betas)
 }
 
-bab_returns  <- bind_rows(bab_list) %>%
-  arrange(year_month) %>%
-  filter(!is.na(bab_exc_m))
 
-bab_mod <- lm(bab_exc_m ~ mkt_exc_m, data = bab_returns)
-bab_alpha  <- coef(bab_mod)[1]
-bab_alpha_t  <- summary(bab_mod)$coefficients[1, 3]
-bab_sharpe  <- mean(bab_returns$bab_exc_m, na.rm = TRUE) /
-  sd(bab_returns$bab_exc_m, na.rm = TRUE) * sqrt(12)
+# ── FUNKTION: Kør hele pipelinen og returner gt-tabel ────────────────────────
 
-# =========================
-# TABEL
-# =========================
-
-decil_tabel  <- decil_resultater  %>%
-  mutate(
-    t_excess     = mean_exc / (sd_exc / sqrt(n_måneder)),
-    volatility   = sd_exc * sqrt(12) * 100,
-    mean_exc_pct = mean_exc * 100,
-    alpha_pct    = alpha * 100
-  )
-
-bab_stats  <- data.frame(
-  mean_exc_pct     = mean(bab_returns$bab_exc_m, na.rm = TRUE) * 100,
-  t_excess         = mean(bab_returns$bab_exc_m) /
-    (sd(bab_returns$bab_exc_m) / sqrt(nrow(bab_returns))),
-  alpha_pct        = bab_alpha * 100,
-  alpha_t          = bab_alpha_t,
-  mean_beta_exante = 0.00,
-  real_beta        = coef(bab_mod)[2],
-  volatility       = sd(bab_returns$bab_exc_m, na.rm = TRUE) * sqrt(12) * 100,
-  sharpe           = bab_sharpe
-)
-
-tabel_df  <- data.frame(
-  Metric = c("Merafkast", "t-stat", "CAPM alpha", "t-stat",
-             "Beta (ex ante)", "Beta (realiseret)", "Volatilitet", "Sharpe ratio")
-)
-
-for (d in 1:10) {
-  row <- decil_tabel  %>% filter(beta_decil == d)
-  tabel_df[[paste0("P", d)]] <- c(
-    row$mean_exc_pct, row$t_excess, row$alpha_pct, row$alpha_t,
-    row$mean_beta_exante, row$real_beta, row$volatility, row$sharpe
-  )
+run_pipeline <- function(vol_w, vol_m, corr_w, corr_m, label) {
+  cat(sprintf("\n══════ %s ══════\n", label))
+  
+  dag_temp <- daglig %>%
+    group_by(id) %>%
+    mutate(beta_ts = ex_ante_beta(ret_exc_d, mkt_exc_d,
+                                  vol_window=vol_w, vol_min=vol_m,
+                                  corr_window=corr_w, corr_min=corr_m)) %>%
+    ungroup() %>%
+    mutate(beta_exante = ifelse(!is.na(beta_ts), w_fast*beta_ts+(1-w_fast)*1, NA_real_))
+  
+  beta_m <- dag_temp %>%
+    filter(!is.na(beta_exante)) %>%
+    mutate(year_month = format(date, "%Y-%m")) %>%
+    group_by(id, year_month) %>%
+    summarise(beta_sort = last(beta_exante), .groups = "drop") %>%
+    mutate(year_month = format(as.Date(paste0(year_month,"-01")) %m+% months(1), "%Y-%m"))
+  
+  dp1 <- aktie_måned %>%
+    left_join(beta_m, by = c("id","year_month")) %>%
+    filter(!is.na(beta_sort), !is.na(ret_exc_m), !is.na(mkt_exc_m), is.finite(beta_sort))
+  
+  dp1 <- dp1 %>% group_by(year_month) %>%
+    mutate(beta_decil = assign_deciles(beta_sort)) %>% ungroup()
+  
+  pm <- dp1 %>% group_by(year_month, beta_decil) %>%
+    summarise(port_exc_m=mean(ret_exc_m), mkt_exc_m=first(mkt_exc_m),
+              mean_beta=mean(beta_sort), n_aktier=n(), .groups="drop")
+  
+  dr <- pm %>% group_by(beta_decil) %>%
+    summarise(alpha=coef(lm(port_exc_m~mkt_exc_m))[1],
+              alpha_t=summary(lm(port_exc_m~mkt_exc_m))$coefficients[1,3],
+              alpha_p=summary(lm(port_exc_m~mkt_exc_m))$coefficients[1,4],
+              real_beta=coef(lm(port_exc_m~mkt_exc_m))[2],
+              mean_beta_exante=mean(mean_beta),
+              mean_exc=mean(port_exc_m), sd_exc=sd(port_exc_m),
+              sharpe=mean(port_exc_m)/sd(port_exc_m)*sqrt(12),
+              n_måneder=n(), mean_n_aktier=mean(n_aktier), .groups="drop")
+  
+  # BAB
+  bab_list <- list(); alle_m <- sort(unique(dp1$year_month))
+  for (i in seq_along(alle_m)) {
+    hold_m <- alle_m[i]
+    ai <- dp1 %>% filter(year_month==hold_m, !is.na(beta_sort), is.finite(beta_sort),
+                         !is.na(ret_m), !is.na(rf_m))
+    if (nrow(ai)<2) next
+    ai <- ai %>% mutate(z=rank(beta_sort), z_bar=mean(z), k=2/sum(abs(z-z_bar)),
+                        w_H=pmax(k*(z-z_bar),0), w_L=pmax(k*(z_bar-z),0))
+    r_L <- sum(ai$w_L*ai$ret_m); r_H <- sum(ai$w_H*ai$ret_m)
+    beta_L <- sum(ai$w_L*ai$beta_sort); beta_H <- sum(ai$w_H*ai$beta_sort)
+    if (beta_L<=0|beta_H<=0) next
+    rf_val <- first(ai$rf_m)
+    bab_list[[i]] <- data.frame(year_month=hold_m,
+                                bab_exc_m=(1/beta_L)*(r_L-rf_val)-(1/beta_H)*(r_H-rf_val),
+                                mkt_exc_m=first(ai$mkt_exc_m), beta_L=beta_L, beta_H=beta_H)
+  }
+  br <- bind_rows(bab_list) %>% arrange(year_month) %>% filter(!is.na(bab_exc_m))
+  bmod <- lm(bab_exc_m~mkt_exc_m, data=br)
+  balpha <- coef(bmod)[1]; balpha_t <- summary(bmod)$coefficients[1,3]
+  bsharpe <- mean(br$bab_exc_m)/sd(br$bab_exc_m)*sqrt(12)
+  
+  cat(sprintf("  BAB: gns=%.4f, alpha=%.4f (t=%.2f), Sharpe=%.2f\n",
+              mean(br$bab_exc_m), balpha, balpha_t, bsharpe))
+  
+  # Byg tabel
+  dt <- dr %>% mutate(t_excess=mean_exc/(sd_exc/sqrt(n_måneder)),
+                      volatility=sd_exc*sqrt(12)*100, mean_exc_pct=mean_exc*100, alpha_pct=alpha*100)
+  bs <- data.frame(mean_exc_pct=mean(br$bab_exc_m)*100,
+                   t_excess=mean(br$bab_exc_m)/(sd(br$bab_exc_m)/sqrt(nrow(br))),
+                   alpha_pct=balpha*100, alpha_t=balpha_t, mean_beta_exante=0,
+                   real_beta=as.numeric(coef(bmod)[2]),
+                   volatility=sd(br$bab_exc_m)*sqrt(12)*100, sharpe=bsharpe)
+  
+  tdf <- data.frame(Metric=c("Merafkast","t-stat","CAPM alpha","t-stat",
+                             "Beta (ex ante)","Beta (realiseret)","Volatilitet","Sharpe ratio"))
+  for (d in 1:10) {
+    row <- dt %>% filter(beta_decil==d)
+    tdf[[paste0("P",d)]] <- c(row$mean_exc_pct, row$t_excess, row$alpha_pct,
+                              row$alpha_t, row$mean_beta_exante, row$real_beta, row$volatility, row$sharpe)
+  }
+  tdf[["BAB"]] <- c(bs$mean_exc_pct, bs$t_excess, bs$alpha_pct, bs$alpha_t,
+                    bs$mean_beta_exante, bs$real_beta, bs$volatility, bs$sharpe)
+  tdf <- tdf %>% mutate(across(where(is.numeric), ~round(.,2)))
+  
+  sig_e <- c(paste0("P",1:10),"BAB")[abs(c(dt$t_excess, bs$t_excess))>1.96]
+  sig_a <- c(paste0("P",1:10),"BAB")[abs(c(dt$alpha_t, bs$alpha_t))>1.96]
+  
+  tgt <- tdf %>% gt(rowname_col="Metric") %>%
+    cols_label(P1=html("P1<br>(lav beta)"), P2=html("P2<br>&nbsp;"),
+               P3=html("P3<br>&nbsp;"), P4=html("P4<br>&nbsp;"), P5=html("P5<br>&nbsp;"),
+               P6=html("P6<br>&nbsp;"), P7=html("P7<br>&nbsp;"), P8=html("P8<br>&nbsp;"),
+               P9=html("P9<br>&nbsp;"), P10=html("P10<br>(høj beta)"), BAB=html("BAB<br>&nbsp;")) %>%
+    cols_align(align="center", columns=c(P1:P10, BAB)) %>%
+    cols_width(Metric~px(110), P1~px(70), P2:P9~px(45), P10~px(70), BAB~px(56)) %>%
+    tab_style(style=cell_text(v_align="top", weight="bold"), locations=cells_column_labels()) %>%
+    tab_style(style=cell_fill(color="#f5f5f5"), locations=cells_body(rows=Metric=="t-stat")) %>%
+    fmt_number(columns=everything(), decimals=2)
+  
+  if (length(sig_e)>0)
+    tgt <- tgt %>% tab_style(style=cell_text(weight="bold"),
+                             locations=cells_body(rows="Merafkast", columns=sig_e))
+  if (length(sig_a)>0)
+    tgt <- tgt %>% tab_style(style=cell_text(weight="bold"),
+                             locations=cells_body(rows="CAPM alpha", columns=sig_a))
+  
+  tgt <- tgt %>%
+    tab_source_note(paste0(label, ". Fed angiver signifikans ved 5%. Volatilitet og Sharpe annualiseret.")) %>%
+    opt_table_font(font="Arial") %>%
+    tab_options(table.font.size=12, column_labels.font.weight="bold",
+                column_labels.border.top.style="solid", column_labels.border.top.width=px(1),
+                column_labels.border.bottom.style="solid", column_labels.border.bottom.width=px(1),
+                table_body.border.bottom.style="solid", table_body.border.bottom.width=px(1),
+                stub.font.weight="bold")
+  
+  return(tgt)
 }
 
-tabel_df[["BAB"]] <- c(
-  bab_stats$mean_exc_pct, bab_stats$t_excess,
-  bab_stats$alpha_pct,    bab_stats$alpha_t,
-  bab_stats$mean_beta_exante, bab_stats$real_beta,
-  bab_stats$volatility,   bab_stats$sharpe
-)
 
-tabel_df  <- tabel_df  %>%
-  mutate(across(where(is.numeric), ~ round(., 2)))
+# ── BEGGE TABELLER UDSKRIVES ────────────────────────────────────────────────
 
-sig_excess  <- c(paste0("P", 1:10), "BAB")[
-  abs(c(decil_tabel$t_excess, bab_stats$t_excess)) > 1.96
-]
-sig_alpha  <- c(paste0("P", 1:10), "BAB")[
-  abs(c(decil_tabel$alpha_t, bab_stats$alpha_t)) > 1.96
-]
+tabel_A <- run_pipeline(vol_w=252, vol_m=120, corr_w=252, corr_m=120,
+                        label="1 års volatilitet, 1 års korrelation")
 
-tabel_gt  <- tabel_df  %>%
-  gt(rowname_col = "Metric") %>%
-  cols_label(
-    P1  = html("P1<br>(lav beta)"),
-    P2  = html("P2<br>&nbsp;"), P3  = html("P3<br>&nbsp;"),
-    P4  = html("P4<br>&nbsp;"), P5  = html("P5<br>&nbsp;"),
-    P6  = html("P6<br>&nbsp;"), P7  = html("P7<br>&nbsp;"),
-    P8  = html("P8<br>&nbsp;"), P9  = html("P9<br>&nbsp;"),
-    P10 = html("P10<br>(høj beta)"),
-    BAB = html("BAB<br>&nbsp;")
-  ) %>%
-  cols_align(align = "center", columns = c(P1:P10, BAB)) %>%
-  cols_width(
-    Metric ~ px(110), P1 ~ px(70), P2:P9 ~ px(45),
-    P10 ~ px(70), BAB ~ px(56)
-  ) %>%
-  tab_style(
-    style = cell_text(v_align = "top", weight = "bold"),
-    locations = cells_column_labels()
-  ) %>%
-  tab_style(
-    style = cell_fill(color = "#f5f5f5"),
-    locations = cells_body(rows = Metric == "t-stat")
-  ) %>%
-  fmt_number(columns = everything(), decimals = 2)
+tabel_B <- run_pipeline(vol_w=126, vol_m=60, corr_w=504, corr_m=315,
+                        label="½ års volatilitet, 2 års korrelation")
 
-if (length(sig_excess) > 0) {
-  tabel_gt  <- tabel_gt  %>%
-    tab_style(
-      style = cell_text(weight = "bold"),
-      locations = cells_body(rows = "Merafkast", columns = sig_excess)
-    )
-}
-
-if (length(sig_alpha) > 0) {
-  tabel_gt <- tabel_gt %>%
-    tab_style(
-      style = cell_text(weight = "bold"),
-      locations = cells_body(rows = "CAPM alpha", columns = sig_alpha)
-    )
-}
-
-tabel_gt  <- tabel_gt  %>%
-  tab_source_note(
-    source_note = "Fed angiver signifikans ved 5% niveau. Volatilitet og Sharpe er annualiseret."
-  ) %>%
-  opt_table_font(font = "Arial") %>%
-  tab_options(
-    table.font.size = 12,
-    column_labels.font.weight = "bold",
-    column_labels.border.top.style    = "solid", column_labels.border.top.width    = px(1),
-    column_labels.border.bottom.style = "solid", column_labels.border.bottom.width = px(1),
-    table_body.border.bottom.style    = "solid", table_body.border.bottom.width    = px(1),
-    stub.font.weight = "bold"
-  )
-
-print(tabel_gt)
+print(tabel_A)
+print(tabel_B)
