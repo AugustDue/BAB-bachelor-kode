@@ -1,0 +1,705 @@
+# =============================================================================
+# SAMLET KODE: BAB — Proposition 1 & 2 + Turnover
+# Frazzini & Pedersen (2014)
+#
+# NAVNGIVNINGSKONVENTION:
+#   _ret     = råt afkast (total return)
+#   _exc     = merafkast (excess return = afkast minus risikofri rente)
+#   _d       = daglig
+#   _m       = månedlig
+#   mkt_     = markedsporteføljen (value-weighted)
+#   port_    = decilportefølje (equal-weighted)
+#   mkt_ret_d   = dagligt råt markedsafkast
+#   mkt_exc_d   = dagligt markedsmerafkast (market_ret - rf)
+#   mkt_exc_m   = månedligt markedsmerafkast (compoundet fra daglige)
+#   port_exc_m  = månedligt porteføljemerafkast (EW gennemsnit af aktiers exc)
+#   ret_exc_d   = dagligt aktiemerafkast (fra datasættet)
+#   ret_exc_m   = månedligt aktiemerafkast (kompounderet fra daglige)
+# =============================================================================
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(gt)
+library(zoo)
+library(lubridate)
+
+# =============================================================================
+# PROPOSITION 1: Alpha falder med beta
+# =============================================================================
+
+# ── STEP 1: Klargør dagligt data ─────────────────────────────────────────────
+
+daglig <- data_daglig %>%
+  mutate(
+    ret_d     = as.numeric(ret),       # dagligt råt afkast
+    ret_exc_d = as.numeric(ret_exc),   # dagligt merafkast (fra datasæt)
+    me        = as.numeric(me)         # markedsværdi
+  ) %>%
+  arrange(id, date)
+
+# Fælles daglig risikofri rente (gennemsnit over alle aktier)
+rf_daglig <- daglig %>%
+  filter(!is.na(ret_d), !is.na(ret_exc_d)) %>%
+  group_by(date) %>%
+  summarise(rf_d = mean(ret_d - ret_exc_d, na.rm = TRUE), .groups = "drop")
+
+# Dagligt råt markedsafkast (value-weighted)
+marked_daglig <- daglig %>%
+  group_by(date) %>%
+  summarise(
+    mkt_ret_d = {
+      valid <- !is.na(ret_d) & !is.na(me) & me > 0
+      if (sum(valid) == 0) NA_real_
+      else weighted.mean(ret_d[valid], me[valid])
+    },
+    .groups = "drop"
+  ) %>%
+  left_join(rf_daglig, by = "date") %>%
+  mutate(mkt_exc_d = mkt_ret_d - rf_d)   # dagligt markedsmerafkast
+
+# Join til aktiedata
+daglig <- daglig %>%
+  left_join(rf_daglig, by = "date") %>%
+  left_join(marked_daglig %>% select(date, mkt_ret_d, mkt_exc_d), by = "date")
+
+
+# ── STEP 2: Funktion til Ex Ante Beta ────────────────────────────────────────
+
+ex_ante_beta <- function(ret_exc_d, mkt_exc_d,
+                         vol_window  = 252,
+                         vol_min     = 120,
+                         corr_window = 5 * 252,
+                         corr_min    = 750) {
+  
+  n <- length(ret_exc_d)
+  betas <- rep(NA_real_, n)
+  if (n <= corr_window) return(betas)
+  
+  # Konverter merafkast til log-merafkast
+  log_exc_i <- log(1 + ret_exc_d)
+  log_exc_m <- log(1 + mkt_exc_d)
+  
+  # Overlappende 3-dags log-merafkast (til korrelation)
+  log3_exc_i <- rep(NA_real_, n)
+  log3_exc_m <- rep(NA_real_, n)
+  for (j in 1:(n - 2)) {
+    if (!is.na(log_exc_i[j]) && !is.na(log_exc_i[j+1]) && !is.na(log_exc_i[j+2])) {
+      log3_exc_i[j] <- log_exc_i[j] + log_exc_i[j+1] + log_exc_i[j+2]
+    }
+    if (!is.na(log_exc_m[j]) && !is.na(log_exc_m[j+1]) && !is.na(log_exc_m[j+2])) {
+      log3_exc_m[j] <- log_exc_m[j] + log_exc_m[j+1] + log_exc_m[j+2]
+    }
+  }
+  
+  for (i in (corr_window + 1):n) {
+    # Volatilitet: uafhængige masks for aktie og marked
+    vol_idx <- max(1, i - vol_window):(i - 1)
+    mask_i <- !is.na(log_exc_i[vol_idx])
+    mask_m <- !is.na(log_exc_m[vol_idx])
+    if (sum(mask_i) < vol_min || sum(mask_m) < vol_min) next
+    
+    sigma_i <- sd(log_exc_i[vol_idx][mask_i])
+    sigma_m <- sd(log_exc_m[vol_idx][mask_m])
+    if (is.na(sigma_m) || sigma_m == 0) next
+    
+    # Korrelation: 5-års vindue af 3-dags log-merafkast
+    corr_idx  <- max(1, i - corr_window):(i - 1)
+    y         <- log3_exc_i[corr_idx]
+    x         <- log3_exc_m[corr_idx]
+    corr_mask <- !is.na(y) & !is.na(x)
+    if (sum(corr_mask) < corr_min) next
+    
+    rho_hat  <- cor(y[corr_mask], x[corr_mask])
+    betas[i] <- rho_hat * (sigma_i / sigma_m)
+  }
+  return(betas)
+}
+
+# ── STEP 3: Beregn beta_TS per aktie ─────────────────────────────────────────
+
+cat("Beregner Ex Ante Beta (kan tage nogle minutter) ...\n")
+
+daglig <- daglig %>%
+  group_by(id) %>%
+  mutate(beta_ts = ex_ante_beta(ret_exc_d, mkt_exc_d)) %>%
+  ungroup()
+
+# ── STEP 4: Shrinkage (Vasicek 1973) ──────────────────
+# ── 4a) Beregn sigma2_TS per aktie: standardfejl^2 af beta-estimatet ────────
+
+daglig <- daglig %>%
+  arrange(id, date) %>%
+  group_by(id) %>%
+  mutate(sigma2_ts = rollapply(
+    data.frame(y = ret_exc_d, x = mkt_exc_d, b = beta_ts),
+    width = 252,
+    FUN = function(df) {
+      y <- df[, 1]
+      x <- df[, 2]
+      b_i <- df[, 3]
+      ok <- !is.na(y) & !is.na(x) & !is.na(b_i)
+      if (sum(ok) < 120) return(NA_real_)
+      y <- y[ok]
+      x <- x[ok]
+      b_i <- b_i[ok]
+      T_i <- length(y)
+      x_bar <- mean(x)
+      v <- sum((x - x_bar)^2)
+      if (v == 0) return(NA_real_)
+      # Brug den sidste beta_ts i vinduet
+      beta_hat <- tail(b_i, 1)
+      # Alpha fra beta_ts: alpha = mean(y) - beta_ts * mean(x)
+      alpha_hat <- mean(y) - beta_hat * x_bar
+      # Residualer fra beta
+      eps <- y - alpha_hat - beta_hat * x
+      # Vasicek: s^2 = sum(eps^2)/(T-2), s_b^2 = s^2/v
+      s2 <- sum(eps^2) / (T_i - 2)
+      s2 / v
+    },
+    by.column = FALSE,
+    fill = NA,
+    align = "right"
+  )) %>%
+  ungroup()
+
+# ── 4b) Beregn sigma2_XS per dato: renset tværsnitsvarians ──────────────────
+
+daglig <- daglig %>%
+  group_by(date) %>%
+  mutate(
+    sigma2_xs = {
+      valid <- !is.na(beta_ts) & !is.na(sigma2_ts)
+      if (sum(valid) < 2) NA_real_
+      else {
+        var_obs  <- var(beta_ts[valid])                    # observeret tværsnitsvarians
+        mean_s2  <- mean(sigma2_ts[valid])                 # gns. estimeringsvarians
+        max(var_obs - mean_s2, 1e-8)                       # renset, med gulv > 0
+      }
+    }
+  ) %>%
+  ungroup()
+
+# ── 4c) Fast shrinkage-vægt (gennemsnit af Vasicek w_i) ─────────────────────
+
+w_fast <- daglig %>%
+  filter(!is.na(sigma2_ts), !is.na(sigma2_xs), (sigma2_xs + sigma2_ts) > 0) %>%
+  mutate(w_i = sigma2_xs / (sigma2_xs + sigma2_ts)) %>%
+  summarise(mean(w_i, na.rm = TRUE)) %>%
+  pull()
+
+cat(sprintf("Fast shrinkage-vægt: %.4f\n", w_fast))
+
+# ── 4d) Anvend shrinkage: beta_exante = w * beta_ts + (1-w) * 1 ─────────────
+daglig <- daglig %>%
+  mutate(beta_exante = ifelse(!is.na(beta_ts),
+                              w_fast * beta_ts + (1 - w_fast) * 1, NA_real_))
+
+# ── STEP 5: Byg månedlige afkast fra dagligt data ───────────────────────────
+
+# 5a) Fælles månedligt markedsmerafkast
+mkt_exc_måned <- marked_daglig %>%
+  filter(!is.na(mkt_exc_d)) %>%
+  mutate(year_month = format(date, "%Y-%m")) %>%
+  group_by(year_month) %>%
+  summarise(mkt_exc_m = prod(1 + mkt_exc_d) - 1, .groups = "drop")
+
+# 5b) Fælles månedlig risikofri rente
+rf_måned <- rf_daglig %>%
+  filter(!is.na(rf_d)) %>%
+  mutate(year_month = format(date, "%Y-%m")) %>%
+  group_by(year_month) %>%
+  summarise(rf_m = prod(1 + rf_d) - 1, .groups = "drop")
+
+# 5c) Aktiens månedlige afkast (råt + merafkast) + markedsværdi
+aktie_måned <- daglig %>%
+  mutate(year_month = format(date, "%Y-%m")) %>%
+  group_by(id, year_month) %>%
+  summarise(
+    ret_exc_m = {
+      valid <- !is.na(ret_exc_d)
+      if (sum(valid) == 0) NA_real_
+      else prod(1 + ret_exc_d[valid]) - 1
+    },
+    ret_m = {
+      valid <- !is.na(ret_d)
+      if (sum(valid) == 0) NA_real_
+      else prod(1 + ret_d[valid]) - 1
+    },
+    me_m = {
+      valid_me <- me[!is.na(me) & me > 0]
+      if (length(valid_me) == 0) NA_real_
+      else last(valid_me)
+    },
+    .groups = "drop"
+  ) %>%
+  left_join(mkt_exc_måned, by = "year_month") %>%
+  left_join(rf_måned, by = "year_month")
+
+
+# ── STEP 6: Aggreger Ex Ante Beta til månedsniveau (med 1-måneds lag) ────────
+
+beta_måned <- daglig %>%
+  filter(!is.na(beta_exante)) %>%
+  mutate(year_month = format(date, "%Y-%m")) %>%
+  group_by(id, year_month) %>%
+  summarise(beta_sort = last(beta_exante), .groups = "drop") %>%
+  mutate(year_month = format(
+    as.Date(paste0(year_month, "-01")) %m+% months(1), "%Y-%m"
+  ))
+
+# ── STEP 7: Merge og filtrer ─────────────────────────────────────────────────
+data_prop1 <- aktie_måned %>%
+  left_join(beta_måned, by = c("id", "year_month")) %>%
+  filter(!is.na(beta_sort), !is.na(ret_exc_m), !is.na(mkt_exc_m),
+         is.finite(beta_sort))
+
+# ── STEP 8: Månedlig decil-tilordning og porteføljeafkast ───────────────────
+
+# 8a) HJÆLPEFUNKTION: Deciltilordning med yderdecilprioritet
+assign_deciles <- function(beta, n_groups = 10) {
+  n <- length(beta)
+  base_size <- n %/% n_groups
+  remainder <- n %% n_groups
+  
+  priority <- c(1, n_groups)
+  inner <- 2:(n_groups - 1)
+  priority <- c(priority, inner[order(pmin(inner - 1, n_groups - inner))])
+  
+  sizes <- rep(base_size, n_groups)
+  if (remainder > 0) {
+    sizes[priority[1:remainder]] <- sizes[priority[1:remainder]] + 1
+  }
+  
+  ranks <- rank(beta, ties.method = "first")
+  breaks <- cumsum(c(0, sizes))
+  decil <- rep(NA_integer_, n)
+  for (g in 1:n_groups) {
+    decil[ranks > breaks[g] & ranks <= breaks[g + 1]] <- g
+  }
+  return(decil)
+}
+
+# 8b) Tildel deciler HVER MÅNED med yderdecilprioritet
+data_prop1 <- data_prop1 %>%
+  group_by(year_month) %>%
+  mutate(beta_decil = assign_deciles(beta_sort)) %>%
+  ungroup()
+
+# 8c) Equal-weighted porteføljemerafkast per decil per måned
+port_måned <- data_prop1 %>%
+  group_by(year_month, beta_decil) %>%
+  summarise(
+    port_exc_m  = mean(ret_exc_m),      # EW portefølje-MERAFKAST
+    mkt_exc_m   = first(mkt_exc_m),     # fælles markeds-MERAFKAST
+    mean_beta   = mean(beta_sort),      # EW gennemsnits-beta
+    n_aktier    = n(),
+    .groups     = "drop"
+  )
+
+# 8d) Tidsserieregression per decil
+decil_resultater <- port_måned %>%
+  group_by(beta_decil) %>%
+  summarise(
+    alpha      = coef(lm(port_exc_m ~ mkt_exc_m))[1],
+    alpha_t    = summary(lm(port_exc_m ~ mkt_exc_m))$coefficients[1, 3],
+    alpha_p    = summary(lm(port_exc_m ~ mkt_exc_m))$coefficients[1, 4],
+    real_beta  = coef(lm(port_exc_m ~ mkt_exc_m))[2],
+    mean_beta_exante = mean(mean_beta),
+    mean_exc   = mean(port_exc_m),
+    sd_exc     = sd(port_exc_m),
+    sharpe     = mean(port_exc_m) / sd(port_exc_m) * sqrt(12),
+    n_måneder    = n(),
+    mean_n_aktier = mean(n_aktier),
+    .groups       = "drop"
+  )
+
+# ── STEP 9: Test af sharpe ratio ─────────────────────────────────────────────
+
+mod_iii <- lm(sharpe ~ mean_beta_exante, data = decil_resultater)
+print(summary(mod_iii))
+if (coef(mod_iii)["mean_beta_exante"] < 0) {
+  cat("BEKRÆFTET: Sharpe falder med beta.\n")
+} else {
+  cat("AFVIST.\n")
+}
+
+# ── STEP 10: SML-plot ────────────────────────────────────────────────────────
+
+lambda <- mean(port_måned$mkt_exc_m, na.rm = TRUE)
+
+aktie_summary <- data_prop1 %>%
+  group_by(id) %>%
+  filter(n() >= 24) %>%
+  summarise(
+    mean_ret        = mean(ret_exc_m, na.rm = TRUE),
+    mean_beta_exante = mean(beta_sort,    na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(is.finite(mean_ret) & is.finite(mean_beta_exante))
+
+mod_ii        <- lm(mean_ret ~ mean_beta_exante, data = aktie_summary)
+sml_hældning <- coef(mod_ii)["mean_beta_exante"]
+
+cat(sprintf("Antal aktier i SML-regression: %d\n", nrow(aktie_summary)))
+
+p_sml <- ggplot(aktie_summary, aes(x = mean_beta_exante, y = mean_ret)) +
+  geom_point(alpha = 0.15, size = 0.6, color = "gray40") +
+  geom_smooth(method = "lm", se = TRUE, color = "blue", lwd = 1) +
+  geom_abline(intercept = 0, slope = lambda,
+              color = "red", lwd = 1, linetype = "dashed") +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray70") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
+  coord_cartesian(
+    xlim = c(0, quantile(aktie_summary$mean_beta_exante, 0.99, na.rm = TRUE)),
+    ylim = c(quantile(aktie_summary$mean_ret, 0.01, na.rm = TRUE),
+             quantile(aktie_summary$mean_ret, 0.99, na.rm = TRUE))
+  ) +
+  annotate("text",
+           x     = quantile(aktie_summary$mean_beta_exante, 0.85, na.rm = TRUE),
+           y     = lambda * quantile(aktie_summary$mean_beta_exante, 0.85, na.rm = TRUE) * 1.4,
+           label = "Teoretisk SML",
+           color = "red", size = 3.5) +
+  annotate("text",
+           x     = quantile(aktie_summary$mean_beta_exante, 0.85, na.rm = TRUE),
+           y     = sml_hældning * quantile(aktie_summary$mean_beta_exante, 0.85, na.rm = TRUE) * 0.6,
+           label = "Empirisk SML",
+           color = "blue", size = 3.5) +
+  labs(
+    title    = "",
+    subtitle = "",
+    x = "Gns. Beta Ex Ante",
+    y = "Gns. månedligt merafkast"
+  ) +
+  theme_minimal()
+print(p_sml)
+
+
+# =============================================================================
+# PROPOSITION 2: BAB-faktor + Turnover
+# =============================================================================
+
+# ── STEP 11: Konstruktion af BAB med gemte vægte ────────────────────────────
+
+bab_list    <- list()
+weight_list <- list()    # GEM VÆGTE TIL TURNOVER
+alle_måneder <- sort(unique(data_prop1$year_month))
+
+for (i in seq_along(alle_måneder)) {
+  hold_m <- alle_måneder[i]
+  
+  aktier_i <- data_prop1 %>%
+    filter(year_month == hold_m,
+           !is.na(beta_sort), is.finite(beta_sort),
+           !is.na(ret_m), !is.na(rf_m))
+  if (nrow(aktier_i) < 2) next
+  
+  # ── Z-score ranking ──
+  aktier_i <- aktier_i %>%
+    mutate(
+      z     = rank(beta_sort),
+      z_bar = mean(z),
+      k     = 2 / sum(abs(z - z_bar)),
+      w_H   = pmax(k * (z - z_bar), 0),
+      w_L   = pmax(k * (z_bar - z), 0)
+    )
+  
+  # ── Porteføljeafkast ──
+  r_L <- sum(aktier_i$w_L * aktier_i$ret_m)
+  r_H <- sum(aktier_i$w_H * aktier_i$ret_m)
+  
+  # ── Porteføljebetaer ──
+  beta_L <- sum(aktier_i$w_L * aktier_i$beta_sort)
+  beta_H <- sum(aktier_i$w_H * aktier_i$beta_sort)
+  
+  if (beta_L <= 0 | beta_H <= 0) next
+  
+  # ── Fælles risikofri rente for måneden ──
+  rf_m <- first(aktier_i$rf_m)
+  
+  # ── BAB-afkast ──
+  bab_exc_m <- (1 / beta_L) * (r_L - rf_m) - (1 / beta_H) * (r_H - rf_m)
+  
+  bab_list[[i]] <- data.frame(
+    year_month  = hold_m,
+    bab_exc_m   = bab_exc_m,
+    mkt_exc_m   = first(aktier_i$mkt_exc_m),
+    rf_m        = rf_m,
+    r_L         = r_L,
+    r_H         = r_H,
+    beta_L      = beta_L,
+    beta_H      = beta_H
+  )
+  
+  # ── Gem vægte til turnover-beregning ──
+  # Faktiske BAB-vægte inkl. leverage-skalering
+  weight_list[[i]] <- data.frame(
+    year_month = hold_m,
+    id         = aktier_i$id,
+    w_L        = aktier_i$w_L / beta_L,   # long-side (leveret)
+    w_H        = aktier_i$w_H / beta_H    # short-side (leveret)
+  )
+}
+
+bab_returns <- bind_rows(bab_list) %>%
+  arrange(year_month) %>%
+  filter(!is.na(bab_exc_m))
+
+all_weights <- bind_rows(weight_list) %>%
+  arrange(year_month, id)
+
+
+# ── STEP 12: Turnover-beregning ──────────────────────────────────────────────
+# Turnover_t = (1/2) * sum_i |w_{i,t} - w_{i,t-1}|
+# Beregnes separat for long-side og short-side, samt total BAB
+
+turnover_list <- list()
+sorted_months <- sort(unique(all_weights$year_month))
+
+for (j in 2:length(sorted_months)) {
+  m_curr <- sorted_months[j]
+  m_prev <- sorted_months[j - 1]
+  
+  w_curr <- all_weights %>% filter(year_month == m_curr)
+  w_prev <- all_weights %>% filter(year_month == m_prev)
+  
+  # Fuld join: aktier der kun er i én periode får vægt 0 i den anden
+  merged <- full_join(
+    w_curr %>% select(id, w_L_curr = w_L, w_H_curr = w_H),
+    w_prev %>% select(id, w_L_prev = w_L, w_H_prev = w_H),
+    by = "id"
+  ) %>%
+    mutate(
+      w_L_curr = replace_na(w_L_curr, 0),
+      w_L_prev = replace_na(w_L_prev, 0),
+      w_H_curr = replace_na(w_H_curr, 0),
+      w_H_prev = replace_na(w_H_prev, 0)
+    )
+  
+  # Turnover per side (standard definition: 1/2 * sum |delta w|)
+  turnover_L <- 0.5 * sum(abs(merged$w_L_curr - merged$w_L_prev))
+  turnover_H <- 0.5 * sum(abs(merged$w_H_curr - merged$w_H_prev))
+  
+  # Total BAB turnover = long-side + short-side
+  turnover_total <- turnover_L + turnover_H
+  
+  turnover_list[[j]] <- data.frame(
+    year_month     = m_curr,
+    turnover_long  = turnover_L,
+    turnover_short = turnover_H,
+    turnover_total = turnover_total
+  )
+}
+
+turnover_df <- bind_rows(turnover_list) %>%
+  arrange(year_month)
+
+# ── Turnover-opsummering (annualiseret = 12 * månedlig) ──
+cat("\n=== BAB Turnover ===\n")
+cat(sprintf("Gns. månedlig turnover (long):   %.2f%%\n",
+            mean(turnover_df$turnover_long, na.rm = TRUE) * 100))
+cat(sprintf("Gns. månedlig turnover (short):  %.2f%%\n",
+            mean(turnover_df$turnover_short, na.rm = TRUE) * 100))
+cat(sprintf("Gns. månedlig turnover (total):  %.2f%%\n",
+            mean(turnover_df$turnover_total, na.rm = TRUE) * 100))
+cat(sprintf("Gns. årlig turnover (long):      %.1f%%\n",
+            mean(turnover_df$turnover_long, na.rm = TRUE) * 12 * 100))
+cat(sprintf("Gns. årlig turnover (short):     %.1f%%\n",
+            mean(turnover_df$turnover_short, na.rm = TRUE) * 12 * 100))
+cat(sprintf("Gns. årlig turnover (total):     %.1f%%\n",
+            mean(turnover_df$turnover_total, na.rm = TRUE) * 12 * 100))
+
+
+# ── STEP 13: Turnover-plot (månedlig) ────────────────────────────────────────
+
+turnover_long <- turnover_df %>%
+  pivot_longer(cols = c(turnover_long, turnover_short, turnover_total),
+               names_to = "side", values_to = "turnover") %>%
+  mutate(
+    side = recode(side,
+                  "turnover_long"  = "Long-side",
+                  "turnover_short" = "Short-side",
+                  "turnover_total" = "Total BAB"),
+    dato = as.Date(paste0(year_month, "-01")),
+    turnover_pct = turnover * 100
+  )
+
+p_turnover <- ggplot(turnover_long,
+                     aes(x = dato, y = turnover_pct, color = side)) +
+  geom_line(alpha = 0.7, linewidth = 0.5) +
+  scale_color_manual(values = c("Long-side"  = "#2196F3",
+                                "Short-side" = "#F44336",
+                                "Total BAB"  = "#4CAF50")) +
+  labs(title    = "Månedlig BAB-turnover",
+       subtitle = "Turnover = ½ Σ|w_i,t − w_i,t−1|, beregnet separat for long- og short-side",
+       x = "År", y = "Turnover (%)", color = "") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+print(p_turnover)
+
+
+# ── STEP 14: CAPM-regression og BAB-statistikker ────────────────────────────
+
+bab_mod     <- lm(bab_exc_m ~ mkt_exc_m, data = bab_returns)
+bab_alpha   <- coef(bab_mod)[1]
+bab_alpha_t <- summary(bab_mod)$coefficients[1, 3]
+bab_sharpe  <- mean(bab_returns$bab_exc_m, na.rm = TRUE) /
+  sd(bab_returns$bab_exc_m, na.rm = TRUE) * sqrt(12)
+
+
+# ── STEP 15: Kumulativt BAB-plot ─────────────────────────────────────────────
+
+bab_returns <- bab_returns %>%
+  arrange(year_month) %>%
+  mutate(kumulativt = cumprod(1 + bab_exc_m))
+
+p_bab <- ggplot(bab_returns,
+                aes(x = as.Date(paste0(year_month, "-01")), y = kumulativt)) +
+  geom_line(color = "#2196F3", lwd = 0.8) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "gray50") +
+  labs(title = "Proposition 2: Kumulativt BAB-merafkast (F&P ligning 17)",
+       subtitle = "Ex Ante Beta, månedlig rebalancering",
+       x = "År", y = "Kumulativt merafkast (indekseret til 1)") +
+  theme_minimal()
+print(p_bab)
+
+
+# =============================================================================
+# TABEL: Beta-sorterede porteføljer (replikation af F&P Tabel 3)
+# =============================================================================
+
+# ── STEP 16: Tilføj excess return t-stat til decilresultater ─────────────────
+decil_tabel <- decil_resultater %>%
+  mutate(
+    t_excess = mean_exc / (sd_exc / sqrt(n_måneder)),
+    volatility = sd_exc * sqrt(12) * 100,
+    mean_exc_pct = mean_exc * 100,
+    alpha_pct = alpha * 100
+  )
+
+# ── STEP 17: BAB-statistikker ────────────────────────────────────────────────
+bab_stats <- data.frame(
+  mean_exc_pct = mean(bab_returns$bab_exc_m, na.rm = TRUE) * 100,
+  t_excess = mean(bab_returns$bab_exc_m) /
+    (sd(bab_returns$bab_exc_m) / sqrt(nrow(bab_returns))),
+  alpha_pct = bab_alpha * 100,
+  alpha_t = bab_alpha_t,
+  mean_beta_exante = 0.00,
+  real_beta = coef(bab_mod)[2],
+  volatility = sd(bab_returns$bab_exc_m, na.rm = TRUE) * sqrt(12) * 100,
+  sharpe = bab_sharpe
+)
+
+# ── STEP 18: Byg data frame til gt-tabel ────────────────────────────────────
+tabel_df <- data.frame(
+  Metric = c("Merafkast", "t-stat", "CAPM alpha", "t-stat",
+             "Beta (ex ante)", "Beta (realiseret)", "Volatilitet", "Sharpe ratio")
+)
+
+for (d in 1:10) {
+  row <- decil_tabel %>% filter(beta_decil == d)
+  tabel_df[[paste0("P", d)]] <- c(
+    row$mean_exc_pct,
+    row$t_excess,
+    row$alpha_pct,
+    row$alpha_t,
+    row$mean_beta_exante,
+    row$real_beta,
+    row$volatility,
+    row$sharpe
+  )
+}
+
+tabel_df[["BAB"]] <- c(
+  bab_stats$mean_exc_pct,
+  bab_stats$t_excess,
+  bab_stats$alpha_pct,
+  bab_stats$alpha_t,
+  bab_stats$mean_beta_exante,
+  bab_stats$real_beta,
+  bab_stats$volatility,
+  bab_stats$sharpe
+)
+
+tabel_df <- tabel_df %>%
+  mutate(across(where(is.numeric), ~ round(., 2)))
+
+# ── STEP 19: gt-tabel ────────────────────────────────────────────────────────
+sig_excess <- c(paste0("P", 1:10), "BAB")[
+  abs(c(decil_tabel$t_excess, bab_stats$t_excess)) > 1.96
+]
+sig_alpha <- c(paste0("P", 1:10), "BAB")[
+  abs(c(decil_tabel$alpha_t, bab_stats$alpha_t)) > 1.96
+]
+
+tabel_gt <- tabel_df %>%
+  gt(rowname_col = "Metric") %>%
+  tab_header(
+    title = "Beta-sorterede porteføljer",
+    subtitle = "Afkast i månedlig procent"
+  ) %>%
+  tab_spanner(
+    label = "Beta-deciler og BAB",
+    columns = c(P1, P2, P3, P4, P5, P6, P7, P8, P9, P10, BAB)
+  ) %>%
+  cols_label(
+    P1  = html("P1<br>(lav beta)"),
+    P2  = html("P2<br>&nbsp;"),
+    P3  = html("P3<br>&nbsp;"),
+    P4  = html("P4<br>&nbsp;"),
+    P5  = html("P5<br>&nbsp;"),
+    P6  = html("P6<br>&nbsp;"),
+    P7  = html("P7<br>&nbsp;"),
+    P8  = html("P8<br>&nbsp;"),
+    P9  = html("P9<br>&nbsp;"),
+    P10 = html("P10<br>(høj beta)"),
+    BAB = html("BAB<br>&nbsp;")
+  ) %>%
+  cols_align(align = "center", columns = c(P1:P10, BAB)) %>%
+  cols_width(
+    Metric ~ px(110),
+    P1 ~ px(70),
+    P2:P9 ~ px(45),
+    P10 ~ px(70),
+    BAB    ~ px(56)
+  ) %>%
+  tab_style(
+    style = cell_text(v_align = "top", weight = "bold"),
+    locations = cells_column_labels()
+  ) %>%
+  tab_style(
+    style = cell_fill(color = "#f5f5f5"),
+    locations = cells_body(rows = Metric == "t-stat")
+  ) %>%
+  fmt_number(columns = everything(), decimals = 2)
+
+if (length(sig_excess) > 0) {
+  tabel_gt <- tabel_gt %>%
+    tab_style(
+      style = cell_text(weight = "bold"),
+      locations = cells_body(rows = "Merafkast", columns = sig_excess)
+    )
+}
+
+if (length(sig_alpha) > 0) {
+  tabel_gt <- tabel_gt %>%
+    tab_style(
+      style = cell_text(weight = "bold"),
+      locations = cells_body(rows = "CAPM alpha", columns = sig_alpha)
+    )
+}
+
+tabel_gt <- tabel_gt %>%
+  tab_footnote(
+    footnote = "t-statistikker i parentes. Fed angiver signifikans ved 5% niveau. Volatilitet og Sharpe er annualiseret.",
+    locations = cells_title(groups = "title")
+  ) %>%
+  opt_table_font(font = "Arial") %>%
+  tab_options(
+    table.font.size = 12,
+    heading.title.font.size = 14,
+    column_labels.font.weight = "bold",
+    stub.font.weight = "bold"
+  )
+
+print(tabel_gt)
