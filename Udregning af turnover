@@ -5,7 +5,7 @@
 # NYSE-STYLE BREAKPOINTS:
 #   I USA sættes breakpoints ud fra NYSE-aktier (~30-40% af universet, 
 #   overvejende store aktier). Vi efterligner dette ved at bruge de 
-#   største 40% af aktierne som referencesæt til at definere 
+#   største 30% af aktierne som referencesæt til at definere 
 #   decil-grænser. Alle aktier sorteres derefter ind i disse buckets.
 #   Resultatet: Nano indeholder mange små aktier, Mega indeholder få 
 #   men store — præcis som i Novy-Marx & Velikov.
@@ -15,14 +15,14 @@
 
 # ── HJÆLPEFUNKTION: NYSE-style størrelses-deciler ────────────────────────────
 #
-# 1. Tag de største `ref_frac` (30%) af aktierne som referencesæt
+# 1. Tag de største `ref_frac` (40%) af aktierne som referencesæt
 # 2. Beregn 9 breakpoints (10., 20., ..., 90. percentil) fra dette sæt
 # 3. Sortér ALLE aktier ind i 10 deciler ud fra disse breakpoints
 #    → Aktier under referencesættets 10. percentil → decil 1 (Nano)
 #    → Aktier over referencesættets 90. percentil → decil 10 (Mega)
 #    → Mange små aktier samles i de nedre deciler (ulige gruppers størrelse)
 
-assign_size_deciles_nyse <- function(me, ref_frac = 0.30) {
+assign_size_deciles_nyse <- function(me, ref_frac = 0.40) {
   # Referencesæt: de største ref_frac af aktierne
   threshold <- quantile(me, 1 - ref_frac, na.rm = TRUE)
   ref_me    <- me[me >= threshold]
@@ -286,3 +286,28 @@ p_turnover <- ggplot(turnover_monthly,
   theme_minimal() +
   theme(legend.position = "bottom")
 print(p_turnover)
+
+# =============================================================================
+# Gennemsnitligt antal virksomheder per størrelses-decil
+# =============================================================================
+
+avg_per_decil <- all_weights %>%
+  group_by(year_month, size_decil) %>%
+  summarise(n_firmaer = n(), .groups = "drop") %>%
+  group_by(size_decil) %>%
+  summarise(gns_firmaer = round(mean(n_firmaer), 1), .groups = "drop") %>%
+  arrange(desc(size_decil))
+
+size_labels <- c(
+  "10" = "Mega", "9" = "2", "8" = "3", "7" = "4", "6" = "5",
+  "5" = "6",     "4" = "7", "3" = "8", "2" = "Micro", "1" = "Nano"
+)
+
+avg_per_decil <- avg_per_decil %>%
+  mutate(Decil = size_labels[as.character(size_decil)])
+
+cat("Gennemsnitligt antal virksomheder per størrelses-decil:\n\n")
+for (i in 1:nrow(avg_per_decil)) {
+  cat(sprintf("  %-6s  %.1f\n", avg_per_decil$Decil[i], avg_per_decil$gns_firmaer[i]))
+}
+cat(sprintf("\n  Total   %.1f\n", sum(avg_per_decil$gns_firmaer)))
