@@ -1,42 +1,36 @@
 # =============================================================================
 # FORLÆNGELSE TIL PROPOSITION 2: BAB Turnover, opdelt på størrelses-deciler
-# Replikation af Novy-Marx & Velikov (2022), Tabel 2
-#
-# NYSE-STYLE BREAKPOINTS:
-#   I USA sættes breakpoints ud fra NYSE-aktier (~30-40% af universet, 
-#   overvejende store aktier). Vi efterligner dette ved at bruge de 
-#   største 30% af aktierne som referencesæt til at definere 
-#   decil-grænser. Alle aktier sorteres derefter ind i disse buckets.
-#   Resultatet: Nano indeholder mange små aktier, Mega indeholder få 
-#   men store — præcis som i Novy-Marx & Velikov.
-#
-# KRÆVER: data_prop1 og øvrige objekter fra Proposition 1 + 2 koden
 # =============================================================================
 
-# ── HJÆLPEFUNKTION: NYSE-style størrelses-deciler ────────────────────────────
+# ── HJÆLPEFUNKTION: Størrelses-deciler baseret på markedsværdi ───────────────
 #
-# 1. Tag de største `ref_frac` (40%) af aktierne som referencesæt
-# 2. Beregn 9 breakpoints (10., 20., ..., 90. percentil) fra dette sæt
-# 3. Sortér ALLE aktier ind i 10 deciler ud fra disse breakpoints
-#    → Aktier under referencesættets 10. percentil → decil 1 (Nano)
-#    → Aktier over referencesættets 90. percentil → decil 10 (Mega)
-#    → Mange små aktier samles i de nedre deciler (ulige gruppers størrelse)
+# Sortér aktier efter me (stigende), beregn kumulativ andel af total
+# markedsværdi, og sæt breakpoints ved 10%, 20%, ..., 90%.
+# Decil 1 (Nano) = de mange små aktier der tilsammen udgør de nederste 10%
+# Decil 10 (Mega) = de få store aktier der tilsammen udgør de øverste 10%
 
-assign_size_deciles_nyse <- function(me, ref_frac = 0.40) {
-  # Referencesæt: de største ref_frac af aktierne
-  threshold <- quantile(me, 1 - ref_frac, na.rm = TRUE)
-  ref_me    <- me[me >= threshold]
+assign_size_deciles_mktcap <- function(me) {
+  # Sortér stigende
+  ord       <- order(me)
+  me_sorted <- me[ord]
   
-  # 9 breakpoints fra referencesættet
-  bp <- quantile(ref_me, probs = seq(0.1, 0.9, by = 0.1), na.rm = TRUE)
+  # Kumulativ andel af total markedsværdi
+  cum_share <- cumsum(me_sorted) / sum(me_sorted)
   
-  # Sortér alle aktier: findInterval returnerer 0-9, vi adderer 1 → 1-10
-  decil <- findInterval(me, bp) + 1L
+  # Find me-værdier ved 10%, 20%, ..., 90% kumulativ andel
+  bp_shares <- seq(0.1, 0.9, by = 0.1)
+  bp_values <- sapply(bp_shares, function(p) {
+    me_sorted[which(cum_share >= p)[1]]
+  })
+  
+  # Tildel deciler: findInterval returnerer 0-9, vi adderer 1 → 1-10
+  decil <- findInterval(me, bp_values) + 1L
+  decil <- pmin(pmax(decil, 1L), 10L)
   return(decil)
 }
 
 
-# ── STEP T1: Genberegn BAB-vægte med NYSE-style størrelses-deciler ───────────
+# ── STEP T1: Genberegn BAB-vægte med markedsværdi-baserede deciler ───────────
 
 weight_list <- list()
 alle_måneder <- sort(unique(data_prop1$year_month))
@@ -65,18 +59,18 @@ for (i in seq_along(alle_måneder)) {
   beta_H <- sum(aktier_i$w_H * aktier_i$beta_sort)
   if (beta_L <= 0 | beta_H <= 0) next
   
-  # ── NYSE-style størrelses-deciler (10 = Mega, 1 = Nano) ──
+  # ── Størrelses-deciler baseret på markedsværdi (10 = Mega, 1 = Nano) ──
   aktier_i <- aktier_i %>%
-    mutate(size_decil = assign_size_deciles_nyse(me_m, ref_frac = 0.40))
+    mutate(size_decil = assign_size_deciles_mktcap(me_m))
   
   # ── Gem vægte: rå rank-vægte + leverede BAB-vægte ──
   weight_list[[i]] <- data.frame(
     year_month = hold_m,
     id         = aktier_i$id,
-    w_L_raw    = aktier_i$w_L,            # rank-weighted (før leverage)
-    w_H_raw    = aktier_i$w_H,            # rank-weighted (før leverage)
-    w_L_bab    = aktier_i$w_L / beta_L,   # BAB long-side (leveret)
-    w_H_bab    = aktier_i$w_H / beta_H,   # BAB short-side (leveret)
+    w_L_raw    = aktier_i$w_L,
+    w_H_raw    = aktier_i$w_H,
+    w_L_bab    = aktier_i$w_L / beta_L,
+    w_H_bab    = aktier_i$w_H / beta_H,
     size_decil = aktier_i$size_decil
   )
 }
@@ -86,7 +80,7 @@ all_weights <- bind_rows(weight_list) %>%
 
 
 # ── Diagnostik: gns. antal firmaer per decil ─────────────────────────────────
-cat("\n=== Gennemsnitligt antal firmaer per størrelses-decil (NYSE-style) ===\n")
+cat("\n=== Gennemsnitligt antal firmaer per størrelses-decil ===\n")
 diag <- all_weights %>%
   group_by(year_month, size_decil) %>%
   summarise(n = n(), .groups = "drop") %>%
@@ -106,7 +100,6 @@ cat(sprintf("  Total   %6.1f firmaer\n", sum(diag$gns)))
 
 
 # ── STEP T2: Månedlig turnover per størrelsesdecil og side ───────────────────
-# Turnover_t = (1/2) * sum_i |w_{i,t} - w_{i,t-1}|
 
 sorted_months <- sort(unique(all_weights$year_month))
 turnover_list <- list()
@@ -118,7 +111,6 @@ for (j in 2:length(sorted_months)) {
   w_curr <- all_weights %>% filter(year_month == m_curr)
   w_prev <- all_weights %>% filter(year_month == m_prev)
   
-  # Full join: aktier der kun er i én periode får vægt 0 i den anden
   merged <- full_join(
     w_curr %>% select(id, size_decil,
                       w_L_raw_curr = w_L_raw, w_H_raw_curr = w_H_raw,
@@ -129,12 +121,10 @@ for (j in 2:length(sorted_months)) {
     by = "id"
   ) %>%
     mutate(
-      # Brug aktuel size_decil; fald tilbage på forrige hvis aktien udgik
       size_decil = coalesce(size_decil, size_decil_prev),
       across(starts_with("w_"), ~ replace_na(., 0))
     )
   
-  # Turnover per aktie per kolonne
   merged <- merged %>%
     mutate(
       dw_L_raw = abs(w_L_raw_curr - w_L_raw_prev),
@@ -143,7 +133,6 @@ for (j in 2:length(sorted_months)) {
       dw_H_bab = abs(w_H_bab_curr - w_H_bab_prev)
     )
   
-  # Aggreger per størrelsesdecil
   by_size <- merged %>%
     group_by(size_decil) %>%
     summarise(
@@ -165,7 +154,6 @@ turnover_all <- bind_rows(turnover_list)
 
 
 # ── STEP T3: Gennemsnitlig ÅRLIG turnover per størrelsesdecil ────────────────
-# Årlig turnover = 12 × gennemsnitlig månedlig turnover
 
 annual_by_size <- turnover_all %>%
   group_by(size_decil) %>%
@@ -174,7 +162,6 @@ annual_by_size <- turnover_all %>%
     .groups = "drop"
   )
 
-# Total-række (sum over alle deciler per måned, derefter gns. × 12)
 total_row <- turnover_all %>%
   group_by(year_month) %>%
   summarise(
@@ -187,7 +174,6 @@ total_row <- turnover_all %>%
 annual_by_size <- bind_rows(annual_by_size, total_row) %>%
   arrange(desc(size_decil))
 
-# Labels
 annual_by_size <- annual_by_size %>%
   mutate(Decil = c(size_labels, "0" = "Total")[as.character(size_decil)]) %>%
   mutate(Decil = factor(Decil,
@@ -196,7 +182,7 @@ annual_by_size <- annual_by_size %>%
   arrange(Decil)
 
 
-# ── STEP T4: gt-tabel (replikation af Novy-Marx & Velikov Tabel 2) ──────────
+# ── STEP T4: gt-tabel ───────────────────────────────────────────────────────
 
 tabel2_df <- annual_by_size %>%
   transmute(
@@ -228,8 +214,7 @@ tabel2_gt <- tabel2_df %>%
       "størrelses-decil. Turnover er beregnet som ½ Σ|w_i,t − w_i,t−1| og",
       "annualiseret (× 12). Rank-weighted beta portfolios er før leverage-",
       "skalering; BAB-kolonnerne er efter 1/β-skalering. Størrelses-deciler",
-      "er dannet med NYSE-style breakpoints: de største 30% af aktierne",
-      "definerer decil-grænser, og alle aktier sorteres ind i disse buckets."
+      "er dannet så hver decil dækker ca. 10% af den samlede markedsværdi."
     )
   ) %>%
   cols_align(align = "center", columns = everything()) %>%
@@ -254,7 +239,7 @@ tabel2_gt <- tabel2_df %>%
 print(tabel2_gt)
 
 
-# ── STEP T5: Turnover-plot (månedlig total BAB-turnover over tid) ────────────
+# ── STEP T5: Turnover-plot ──────────────────────────────────────────────────
 
 turnover_monthly <- turnover_all %>%
   group_by(year_month) %>%
@@ -287,10 +272,8 @@ p_turnover <- ggplot(turnover_monthly,
   theme(legend.position = "bottom")
 print(p_turnover)
 
-# =============================================================================
-# Gennemsnitligt antal virksomheder per størrelses-decil
-# =============================================================================
 
+# ── Diagnostik: gns. antal firmaer per decil ─────────────────────────────────
 avg_per_decil <- all_weights %>%
   group_by(year_month, size_decil) %>%
   summarise(n_firmaer = n(), .groups = "drop") %>%
@@ -298,10 +281,15 @@ avg_per_decil <- all_weights %>%
   summarise(gns_firmaer = round(mean(n_firmaer), 1), .groups = "drop") %>%
   arrange(desc(size_decil))
 
-size_labels <- c(
-  "10" = "Mega", "9" = "2", "8" = "3", "7" = "4", "6" = "5",
-  "5" = "6",     "4" = "7", "3" = "8", "2" = "Micro", "1" = "Nano"
-)
+avg_per_decil <- avg_per_decil %>%
+  mutate(Decil = size_labels[as.character(size_decil)])
+
+cat("\nGennemsnitligt antal virksomheder per størrelses-decil:\n\n")
+for (i in 1:nrow(avg_per_decil)) {
+  cat(sprintf("  %-6s  %.1f\n", avg_per_decil$Decil[i], avg_per_decil$gns_firmaer[i]))
+}
+cat(sprintf("\n  Total   %.1f\n", sum(avg_per_decil$gns_firmaer)))
+
 
 avg_per_decil <- avg_per_decil %>%
   mutate(Decil = size_labels[as.character(size_decil)])
@@ -311,3 +299,4 @@ for (i in 1:nrow(avg_per_decil)) {
   cat(sprintf("  %-6s  %.1f\n", avg_per_decil$Decil[i], avg_per_decil$gns_firmaer[i]))
 }
 cat(sprintf("\n  Total   %.1f\n", sum(avg_per_decil$gns_firmaer)))
+
